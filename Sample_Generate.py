@@ -1,23 +1,51 @@
 import torch
 import json
+import os
 from gidd import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 
-# load the model
+def load_samples_from_file(filename):
+    """Load samples from a text file"""
+    samples = []
+    current_sample = ""
+    with open(filename, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("Sample ") and current_sample:
+                samples.append(current_sample.strip())
+                current_sample = ""
+            elif not line.startswith("Sample ") and line.strip():
+                current_sample += line
+        if current_sample.strip():
+            samples.append(current_sample.strip())
+    return samples
+
+# Check if generated_samples.txt exists
+if os.path.exists("generated_samples.txt"):
+    print("Loading existing generated samples from generated_samples.txt...")
+    texts = load_samples_from_file("generated_samples.txt")
+    print(f"Loaded {len(texts)} samples")
+else:
+    print("Generating new samples...")
+    # load the model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
+    pipe.to(device)
+
+    # Generate Samples
+    texts = pipe.generate(num_samples=4, num_inference_steps=128)
+
+    # save the samples
+    with open("generated_samples.txt", "w", encoding="utf-8") as f:
+        for i, text in enumerate(texts):
+            f.write(f"Sample {i+1}:\n{text}\n\n")
+
+# Load model for self-correction and evaluation
 device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
 pipe.to(device)
 
-# Generate Samples
-texts = pipe.generate(num_samples=4, num_inference_steps=128)
-
-# save the samples
-with open("generated_samples.txt", "w", encoding="utf-8") as f:
-    for i, text in enumerate(texts):
-        f.write(f"Sample {i+1}:\n{text}\n\n")
-
-# do the self-correction
+# do the self-correction (with oscillation avoidance)
 corrected_texts = pipe.self_correction(texts, num_inference_steps=128, early_stopping=True, temperature=0.1)
 
 # save the corrected version
