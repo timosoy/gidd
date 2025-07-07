@@ -147,6 +147,11 @@ with open("generated_samples_metrics.json", "w", encoding="utf-8") as f:
 print("\nEvaluating self-corrected samples...")
 corr_metrics = evaluate_texts(corrected_texts)
 print("Self-corrected samples metrics:", json.dumps(corr_metrics, indent=2))
+
+# Calculate average self_accuracy
+avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
+print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
+
 with open("corrected_samples_metrics.json", "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": corr_metrics,
