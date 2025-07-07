@@ -140,7 +140,7 @@ def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512)
 print("\nEvaluating generated samples...")
 gen_metrics = evaluate_texts(texts)
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
-with open("generated_samples_metrics.json", "w", encoding="utf-8") as f:
+with open("generated_samples_metrics_small.json", "w", encoding="utf-8") as f:
     json.dump({"external_metrics": gen_metrics}, f, indent=2)
 
 # Evaluate self-corrected samples
@@ -152,7 +152,7 @@ print("Self-corrected samples metrics:", json.dumps(corr_metrics, indent=2))
 avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-with open("corrected_samples_metrics.json", "w", encoding="utf-8") as f:
+with open("corrected_samples_metrics_small.json", "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": corr_metrics,
         "self_accuracies": self_accuracies
