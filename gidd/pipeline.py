@@ -72,40 +72,40 @@ class GiddPipeline(nn.Module):
         early_stopping_patience: int = 32,
         show_progress: bool = True,
         dtype: torch.dtype = torch.bfloat16,
-    ) -> list[str]:
+        return_metrics: bool = False,
+    ) -> tuple[list[str], list[float]]:
+        """
+        Self-correction with metrics:
+        Returns:
+            corrected_texts: list of corrected samples
+            self_accuracies: list of self-accuracy for each sample
+        """
         def _correction_step(model, tokenizer, z_t, t, temp):
             logits = model(z_t, t)
             logits[..., tokenizer.mask_token_id] = -1e6
-
             p_t = (logits / temp).softmax(-1)
-
             z_tm1 = sample_categorical(p_t)
             score = (z_tm1 != z_t) * p_t.gather(-1, z_tm1.unsqueeze(-1)).squeeze(-1)
-
             ids = torch.topk(score, 1, dim=-1).indices
             z_tm1 = z_t.scatter(-1, ids, z_tm1.gather(-1, ids))
-
             acc = (z_tm1 == logits.argmax(-1)).float().mean().item()
             return z_tm1, acc
 
         device = next(self.model.parameters()).device
         z_ts = self.tokenizer(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=self.config.max_seq_len)["input_ids"]
         corrected_zts = []
+        self_accuracies = []
         with tqdm.tqdm(total=len(texts) * num_inference_steps, disable=not show_progress) as pbar:
             for z_t in z_ts:
                 max_acc = 0
                 curr_patience = 0
-
                 z_t = z_t.unsqueeze(0).to(device)
                 t = torch.full((z_t.shape[0],), device=device, fill_value=t0)
-
                 logits = self.model(z_t, t)
                 logits[..., self.tokenizer.mask_token_id] = -1e6
-                
                 for i in range(num_inference_steps):
                     with torch.no_grad(), torch.autocast(device.type, dtype=dtype):
                         z_t_next, acc = _correction_step(self.model, self.tokenizer, z_t, t, temperature)
-
                         if early_stopping:
                             if acc > max_acc:
                                 max_acc = acc
@@ -114,14 +114,18 @@ class GiddPipeline(nn.Module):
                                 curr_patience += 1
                                 if curr_patience > early_stopping_patience:
                                     break
-
                             if (z_t == z_t_next).all():
                                 break
                         z_t = z_t_next
                     pbar.update(1)
-
                 corrected_zts.append(z_t)
-
+                final_logits = self.model(z_t, t)
+                final_argmax = final_logits.argmax(-1)
+                self_acc = (z_t == final_argmax).float().mean().item()
+                self_accuracies.append(self_acc)
             corrected_zts = torch.cat(corrected_zts, dim=0)
             corrected_samples = self.tokenizer.batch_decode(corrected_zts, skip_special_tokens=True)
-            return corrected_samples
+            if return_metrics:
+                return corrected_samples, self_accuracies
+            else:
+                return corrected_samples

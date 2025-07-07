@@ -1,9 +1,10 @@
 import torch
 import json
 import os
-from gidd import GiddPipeline
+from gidd.pipeline import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
+from gidd.loss import get_loss
 
 def load_samples_from_file(filename):
     """Load samples from a text file"""
@@ -20,10 +21,34 @@ def load_samples_from_file(filename):
             samples.append(current_sample.strip())
     return samples
 
+def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inference_steps=128):
+    """Generate samples in batches to avoid memory overflow"""
+    all_texts = []
+    num_batches = (total_samples + batch_size - 1) // batch_size
+    
+    print(f"Generating {total_samples} samples in {num_batches} batches of {batch_size}")
+    
+    for i in range(num_batches):
+        current_batch_size = min(batch_size, total_samples - i * batch_size)
+        print(f"Batch {i+1}/{num_batches}: generating {current_batch_size} samples...")
+        
+        batch_texts = pipe.generate(
+            num_samples=current_batch_size, 
+            num_inference_steps=num_inference_steps
+        )
+        all_texts.extend(batch_texts)
+        
+        # Clear GPU cache between batches
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    return all_texts
+
+
 # Check if generated_samples.txt exists
-if os.path.exists("generated_samples.txt"):
+if os.path.exists("generated_samples_small.txt"):
     print("Loading existing generated samples from generated_samples.txt...")
-    texts = load_samples_from_file("generated_samples.txt")
+    texts = load_samples_from_file("generated_samples_small.txt")
     print(f"Loaded {len(texts)} samples")
 else:
     print("Generating new samples...")
@@ -32,11 +57,11 @@ else:
     pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
     pipe.to(device)
 
-    # Generate Samples
-    texts = pipe.generate(num_samples=4, num_inference_steps=128)
+    # Generate Samples in batches
+    texts = generate_samples_in_batches(pipe, total_samples=16, batch_size=16)
 
     # save the samples
-    with open("generated_samples.txt", "w", encoding="utf-8") as f:
+    with open("generated_samples_small.txt", "w", encoding="utf-8") as f:
         for i, text in enumerate(texts):
             f.write(f"Sample {i+1}:\n{text}\n\n")
 
@@ -45,11 +70,13 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
 pipe.to(device)
 
-# do the self-correction (with oscillation avoidance)
-corrected_texts = pipe.self_correction(texts, num_inference_steps=128, early_stopping=True, temperature=0.1)
+# do the self-correction (with oscillation avoidance and metrics)
+corrected_texts, self_accuracies = pipe.self_correction(
+    texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
+)
 
 # save the corrected version
-with open("corrected_samples.txt", "w", encoding="utf-8") as f:
+with open("corrected_samples_small.txt", "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
         f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
 
@@ -69,7 +96,7 @@ with open("comparison.json", "w", encoding="utf-8") as f:
 # =====================
 # Quantitative Evaluation (PPL & Accuracy)
 # =====================
-def evaluate_texts(texts, model_name="gpt2", batch_size=4, max_length=512):
+def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -104,7 +131,7 @@ def evaluate_texts(texts, model_name="gpt2", batch_size=4, max_length=512):
     return {
         "ppl": ppl,
         "accuracy": accuracy,
-        "avg_nll": avg_nll,
+        "avg_nll": avg_nll, 
         "median_nll": median_nll,
         "tokens": total_tokens
     }
@@ -114,11 +141,14 @@ print("\nEvaluating generated samples...")
 gen_metrics = evaluate_texts(texts)
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 with open("generated_samples_metrics.json", "w", encoding="utf-8") as f:
-    json.dump(gen_metrics, f, indent=2)
+    json.dump({"external_metrics": gen_metrics}, f, indent=2)
 
 # Evaluate self-corrected samples
 print("\nEvaluating self-corrected samples...")
 corr_metrics = evaluate_texts(corrected_texts)
 print("Self-corrected samples metrics:", json.dumps(corr_metrics, indent=2))
 with open("corrected_samples_metrics.json", "w", encoding="utf-8") as f:
-    json.dump(corr_metrics, f, indent=2) 
+    json.dump({
+        "external_metrics": corr_metrics,
+        "self_accuracies": self_accuracies
+    }, f, indent=2) 
