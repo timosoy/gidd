@@ -155,5 +155,6 @@ print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 with open("corrected_samples_metrics_small.json", "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": corr_metrics,
-        "self_accuracies": self_accuracies
+        "self_accuracies": self_accuracies,
+        "average_self_accuracy": avg_self_accuracy
     }, f, indent=2) 
