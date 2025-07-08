@@ -4,7 +4,11 @@ import os
 from gidd.pipeline import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
+import torch.nn.functional as F
 from gidd.loss import get_loss
+
+# Create Samples directory if it doesn't exist
+os.makedirs("Samples", exist_ok=True)
 
 def load_samples_from_file(filename):
     """Load samples from a text file"""
@@ -20,6 +24,93 @@ def load_samples_from_file(filename):
         if current_sample.strip():
             samples.append(current_sample.strip())
     return samples
+
+def compute_self_perplexity(pipeline, texts, t_value=0.01, batch_size=4):
+    """
+    Compute self-perplexity using the GIDD model itself.
+    
+    Args:
+        pipeline: GiddPipeline instance
+        texts: List of text strings to evaluate
+        t_value: Time value for diffusion model (lower = closer to clean data)
+        batch_size: Batch size for processing
+    
+    Returns:
+        dict: Contains per-sample and average self-perplexity metrics
+    """
+    device = next(pipeline.model.parameters()).device
+    all_perplexities = []
+    all_nlls = []
+    
+    print(f"Computing self-perplexity for {len(texts)} texts...")
+    
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            
+            # Tokenize the batch
+            tokenized = pipeline.tokenizer(
+                batch_texts, 
+                return_tensors="pt", 
+                padding="max_length", 
+                truncation=True, 
+                max_length=pipeline.config.max_seq_len
+            )
+            input_ids = tokenized["input_ids"].to(device)
+            attention_mask = tokenized["attention_mask"].to(device)
+            
+            # Create time tensor - using small t_value for high quality evaluation
+            batch_size_actual = input_ids.shape[0]
+            t = torch.full((batch_size_actual,), fill_value=t_value, device=device)
+            
+            # Get model predictions
+            logits = pipeline.model(input_ids, t)
+            
+            # Mask out the [MASK] token to prevent the model from predicting it
+            logits[..., pipeline.tokenizer.mask_token_id] = -1e6
+            
+            # Compute cross-entropy loss for each position
+            # Shift inputs: predict next token based on previous tokens
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+            shift_attention = attention_mask[..., :-1].contiguous()
+            
+            # Compute negative log-likelihood for each token
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1), 
+                reduction='none'
+            )
+            loss = loss.view(shift_labels.shape)  # [batch_size, seq_len-1]
+            
+            # Compute per-sample metrics
+            for j in range(batch_size_actual):
+                sample_loss = loss[j]
+                sample_attention = shift_attention[j]
+                
+                # Only consider non-padding tokens
+                valid_tokens = sample_attention.sum().item()
+                if valid_tokens > 0:
+                    # Average NLL for this sample
+                    sample_nll = (sample_loss * sample_attention).sum().item() / valid_tokens
+                    sample_ppl = np.exp(sample_nll)
+                    
+                    all_nlls.append(sample_nll)
+                    all_perplexities.append(sample_ppl)
+    
+    # Compute aggregate metrics
+    avg_nll = np.mean(all_nlls)
+    avg_ppl = np.mean(all_perplexities)
+    median_ppl = np.median(all_perplexities)
+    
+    return {
+        "per_sample_perplexities": all_perplexities,
+        "per_sample_nlls": all_nlls,
+        "average_nll": avg_nll,
+        "average_perplexity": avg_ppl,
+        "median_perplexity": median_ppl,
+        "num_samples": len(all_perplexities)
+    }
 
 def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inference_steps=128):
     """Generate samples in batches to avoid memory overflow"""
@@ -45,23 +136,23 @@ def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inf
     return all_texts
 
 
-# Check if generated_samples.txt exists
-if os.path.exists("generated_samples_small.txt"):
-    print("Loading existing generated samples from generated_samples.txt...")
-    texts = load_samples_from_file("generated_samples_small.txt")
+# Check if generated samples file exists
+if os.path.exists("Samples/generated_samples.txt"):
+    print("Loading existing generated samples from file...")
+    texts = load_samples_from_file("Samples/generated_samples.txt")
     print(f"Loaded {len(texts)} samples")
 else:
     print("Generating new samples...")
-    # load the model
+    # Load the model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
     pipe.to(device)
 
-    # Generate Samples in batches
+    # Generate samples in batches
     texts = generate_samples_in_batches(pipe, total_samples=16, batch_size=16)
 
-    # save the samples
-    with open("generated_samples_small.txt", "w", encoding="utf-8") as f:
+    # Save the samples
+    with open("Samples/generated_samples.txt", "w", encoding="utf-8") as f:
         for i, text in enumerate(texts):
             f.write(f"Sample {i+1}:\n{text}\n\n")
 
@@ -70,18 +161,18 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
 pipe.to(device)
 
-# do the self-correction
+# Perform self-correction
 corrected_texts, self_accuracies = pipe.self_correction(
     texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
 )
 
-# save the corrected version
-with open("corrected_samples_small.txt", "w", encoding="utf-8") as f:
+# Save the corrected samples
+with open("Samples/corrected_samples.txt", "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
         f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
 
-# compare the uncorrected and corrected version
-with open("comparison.json", "w", encoding="utf-8") as f:
+# Compare the original and corrected samples
+with open("Samples/comparison.json", "w", encoding="utf-8") as f:
     comparison = {
         "samples": [
             {
@@ -96,6 +187,22 @@ with open("comparison.json", "w", encoding="utf-8") as f:
 # =====================
 # Quantitative Evaluation (PPL & Accuracy)
 # =====================
+
+# Compute self-perplexity for original samples
+print("\nComputing self-perplexity for generated samples...")
+gen_self_ppl = compute_self_perplexity(pipe, texts, t_value=0.01, batch_size=4)
+print(f"Generated samples self-perplexity: {gen_self_ppl['average_perplexity']:.2f}")
+
+# Compute self-perplexity for corrected samples  
+print("\nComputing self-perplexity for corrected samples...")
+corr_self_ppl = compute_self_perplexity(pipe, corrected_texts, t_value=0.01, batch_size=4)
+print(f"Corrected samples self-perplexity: {corr_self_ppl['average_perplexity']:.2f}")
+
+# Calculate improvement in self-perplexity
+ppl_improvement = gen_self_ppl['average_perplexity'] - corr_self_ppl['average_perplexity']
+ppl_improvement_ratio = corr_self_ppl['average_perplexity'] / gen_self_ppl['average_perplexity']
+print(f"Self-perplexity improvement: {ppl_improvement:.2f} (ratio: {ppl_improvement_ratio:.3f})")
+
 def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
@@ -140,8 +247,11 @@ def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512)
 print("\nEvaluating generated samples...")
 gen_metrics = evaluate_texts(texts)
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
-with open("generated_samples_metrics_small.json", "w", encoding="utf-8") as f:
-    json.dump({"external_metrics": gen_metrics}, f, indent=2)
+with open("Samples/generated_samples_metrics.json", "w", encoding="utf-8") as f:
+    json.dump({
+        "external_metrics": gen_metrics,
+        "self_perplexity_metrics": gen_self_ppl
+    }, f, indent=2)
 
 # Evaluate self-corrected samples
 print("\nEvaluating self-corrected samples...")
@@ -152,9 +262,14 @@ print("Self-corrected samples metrics:", json.dumps(corr_metrics, indent=2))
 avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-with open("corrected_samples_metrics_small.json", "w", encoding="utf-8") as f:
+with open("Samples/corrected_samples_metrics.json", "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": corr_metrics,
         "self_accuracies": self_accuracies,
-        "average_self_accuracy": avg_self_accuracy
+        "average_self_accuracy": avg_self_accuracy,
+        "self_perplexity_metrics": corr_self_ppl,
+        "self_perplexity_improvement": {
+            "absolute_improvement": ppl_improvement,
+            "improvement_ratio": ppl_improvement_ratio
+        }
     }, f, indent=2) 
