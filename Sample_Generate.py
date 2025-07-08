@@ -70,7 +70,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
 pipe.to(device)
 
-# do the self-correction (with oscillation avoidance and metrics)
+# do the self-correction
 corrected_texts, self_accuracies = pipe.self_correction(
     texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
 )
