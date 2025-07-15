@@ -6,6 +6,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 import torch.nn.functional as F
 from gidd.loss import get_loss
+from gidd.likelihood import ELBO, compute_elbo
+from omegaconf import OmegaConf
 
 # Create Samples directory if it doesn't exist
 os.makedirs("Samples", exist_ok=True)
@@ -25,9 +27,9 @@ def load_samples_from_file(filename):
             samples.append(current_sample.strip())
     return samples
 
-def compute_self_perplexity(pipeline, texts, t_value=0.01, batch_size=4):
+def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
     """
-    Compute self-perplexity using the GIDD model itself.
+    Compute self-surprisal using the GIDD model itself.
     
     Args:
         pipeline: GiddPipeline instance
@@ -36,13 +38,13 @@ def compute_self_perplexity(pipeline, texts, t_value=0.01, batch_size=4):
         batch_size: Batch size for processing
     
     Returns:
-        dict: Contains per-sample and average self-perplexity metrics
+        dict: Contains per-sample and average self-surprisal metrics
     """
     device = next(pipeline.model.parameters()).device
     all_perplexities = []
     all_nlls = []
     
-    print(f"Computing self-perplexity for {len(texts)} texts...")
+    print(f"Computing self-surprisal for {len(texts)} texts...")
     
     with torch.no_grad():
         for i in range(0, len(texts), batch_size):
@@ -104,11 +106,11 @@ def compute_self_perplexity(pipeline, texts, t_value=0.01, batch_size=4):
     median_ppl = np.median(all_perplexities)
     
     return {
-        "per_sample_perplexities": all_perplexities,
+        "per_sample_surprisals": all_perplexities,
         "per_sample_nlls": all_nlls,
         "average_nll": avg_nll,
-        "average_perplexity": avg_ppl,
-        "median_perplexity": median_ppl,
+        "average_surprisal": avg_ppl,
+        "median_surprisal": median_ppl,
         "num_samples": len(all_perplexities)
     }
 
@@ -135,11 +137,119 @@ def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inf
     
     return all_texts
 
+def compute_self_ppl_with_elbo(pipeline, texts, num_samples=64, t_eps=1e-4, batch_size=4):
+    """
+    Compute self-PPL using the theoretically correct ELBO method from likelihood.py
+    
+    Args:
+        pipeline: GiddPipeline instance
+        texts: List of text strings to evaluate
+        num_samples: Number of time steps to sample for ELBO integration
+        t_eps: Small epsilon for time bounds
+        batch_size: Batch size for processing
+    
+    Returns:
+        dict: Contains per-sample and average ELBO-based perplexity metrics
+    """
+    device = next(pipeline.model.parameters()).device
+    
+    # Load the real GIDD config file
+    config_path = "gidd/gidd/configs/gidd.yaml"
+    if os.path.exists(config_path):
+        print(f"Loading real config from: {config_path}")
+        # Load the complete config with all defaults resolved
+        config = OmegaConf.load(config_path)
+        print(f"Config loaded - loss_type: {config.loss.loss_type}, loss_weighting: {config.loss.loss_weighting}")
+        
+        # Copy necessary attributes from the pipeline config
+        if hasattr(pipeline.config, 'max_seq_len'):
+            config.max_seq_len = pipeline.config.max_seq_len
+        if hasattr(pipeline.config, 'p_uniform'):
+            config.model.p_uniform = pipeline.config.p_uniform
+        if hasattr(pipeline.config, 't_eps'):
+            config.model.t_eps = pipeline.config.t_eps
+            
+        # Get the loss function using the real config
+        print("Creating loss function with real config...")
+        loss_fn = get_loss(config, pipeline.tokenizer, pipeline.noise_schedule)
+        print("Loss function created successfully")
+    else:
+        # Fallback to mock config if file not found
+        print(f"Config file not found at {config_path}, using fallback mock config")
+        from gidd.loss import GiddLoss
+        
+        class MockLossConfig:
+            def __init__(self):
+                self.loss_weighting = "uniform"
+                self.min_loss_weight = 0.1
+                self.max_loss_weight = 1.0
+        
+        class MockConfig:
+            def __init__(self, real_config):
+                for attr in ['max_seq_len', 'p_uniform', 't_eps']:
+                    if hasattr(real_config, attr):
+                        setattr(self, attr, getattr(real_config, attr))
+                self.loss = MockLossConfig()
+        
+        config = MockConfig(pipeline.config)
+        loss_fn = GiddLoss(config, pipeline.tokenizer, pipeline.noise_schedule)
+    
+    # Create ELBO function
+    elbo_fn = ELBO(config, pipeline.model, pipeline.noise_schedule, loss_fn)
+    
+    all_metrics = []
+    
+    print(f"Computing ELBO-based self-PPL for {len(texts)} texts with {num_samples} time samples...")
+    
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            
+            # Tokenize the batch
+            batch = pipeline.tokenizer(
+                batch_texts, 
+                return_tensors="pt", 
+                padding="max_length", 
+                truncation=True, 
+                max_length=pipeline.config.max_seq_len
+            )
+            # Move to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Compute ELBO for this batch
+            batch_metrics = compute_elbo(
+                elbo_fn, 
+                batch, 
+                num_samples=num_samples, 
+                t_eps=t_eps, 
+                return_token_nlls=False, 
+                reduce_metrics=False, 
+                show_progress=False
+            )
+            
+            all_metrics.append(batch_metrics)
+    
+    # Aggregate metrics across all batches
+    # Note: This is a simplified aggregation - for full accuracy we'd need to 
+    # properly weight by number of tokens in each batch
+    avg_nll = np.mean([m["nll"].item() for m in all_metrics])
+    avg_ppl = np.mean([m["ppl"].item() for m in all_metrics])
+    avg_seq_nll = np.mean([m["seq_nll"].item() for m in all_metrics])
+    
+    return {
+        "average_nll": avg_nll,
+        "average_perplexity": avg_ppl,
+        "average_seq_nll": avg_seq_nll,
+        "num_samples": len(texts),
+        "num_time_samples": num_samples,
+        "method": "ELBO"
+    }
+
 
 # Check if generated samples file exists
-if os.path.exists("Samples/generated_samples.txt"):
+if os.path.exists("Samples/generated_samples_small.txt"):
     print("Loading existing generated samples from file...")
-    texts = load_samples_from_file("Samples/generated_samples.txt")
+    texts = load_samples_from_file("Samples/generated_samples_small.txt")
     print(f"Loaded {len(texts)} samples")
 else:
     print("Generating new samples...")
@@ -152,7 +262,7 @@ else:
     texts = generate_samples_in_batches(pipe, total_samples=16, batch_size=16)
 
     # Save the samples
-    with open("Samples/generated_samples.txt", "w", encoding="utf-8") as f:
+    with open("Samples/generated_samples_small.txt", "w", encoding="utf-8") as f:
         for i, text in enumerate(texts):
             f.write(f"Sample {i+1}:\n{text}\n\n")
 
@@ -167,7 +277,7 @@ corrected_texts, self_accuracies = pipe.self_correction(
 )
 
 # Save the corrected samples
-with open("Samples/corrected_samples.txt", "w", encoding="utf-8") as f:
+with open("Samples/corrected_samples_small.txt", "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
         f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
 
@@ -188,20 +298,35 @@ with open("Samples/comparison.json", "w", encoding="utf-8") as f:
 # Quantitative Evaluation (PPL & Accuracy)
 # =====================
 
-# Compute self-perplexity for original samples
-print("\nComputing self-perplexity for generated samples...")
-gen_self_ppl = compute_self_perplexity(pipe, texts, t_value=0.01, batch_size=4)
-print(f"Generated samples self-perplexity: {gen_self_ppl['average_perplexity']:.2f}")
+# Compute self-surprisal for original samples (simplified method)
+print("\nComputing self-surprisal for generated samples (simplified method)...")
+gen_self_surprisal = compute_self_surprisal(pipe, texts, t_value=0.01, batch_size=4)
+print(f"Generated samples self-surprisal: {gen_self_surprisal['average_surprisal']:.2f}")
 
-# Compute self-perplexity for corrected samples  
-print("\nComputing self-perplexity for corrected samples...")
-corr_self_ppl = compute_self_perplexity(pipe, corrected_texts, t_value=0.01, batch_size=4)
-print(f"Corrected samples self-perplexity: {corr_self_ppl['average_perplexity']:.2f}")
+# Compute self-surprisal for corrected samples (simplified method)
+print("\nComputing self-surprisal for corrected samples (simplified method)...")
+corr_self_surprisal = compute_self_surprisal(pipe, corrected_texts, t_value=0.01, batch_size=4)
+print(f"Corrected samples self-surprisal: {corr_self_surprisal['average_surprisal']:.2f}")
 
-# Calculate improvement in self-perplexity
-ppl_improvement = gen_self_ppl['average_perplexity'] - corr_self_ppl['average_perplexity']
-ppl_improvement_ratio = corr_self_ppl['average_perplexity'] / gen_self_ppl['average_perplexity']
-print(f"Self-perplexity improvement: {ppl_improvement:.2f} (ratio: {ppl_improvement_ratio:.3f})")
+# Calculate improvement in self-surprisal (simplified method)
+self_surprisal_improvement = gen_self_surprisal['average_surprisal'] - corr_self_surprisal['average_surprisal']
+self_surprisal_improvement_ratio = corr_self_surprisal['average_surprisal'] / gen_self_surprisal['average_surprisal']
+print(f"Self-surprisal improvement: {self_surprisal_improvement:.2f} (ratio: {self_surprisal_improvement_ratio:.3f})")
+
+# Compute self-PPL using ELBO method for original samples
+print("\nComputing self-PPL for generated samples (ELBO method)...")
+gen_self_ppl = compute_self_ppl_with_elbo(pipe, texts, num_samples=32, batch_size=2)
+print(f"Generated samples self-PPL: {gen_self_ppl['average_perplexity']:.2f}")
+
+# Compute self-PPL using ELBO method for corrected samples
+print("\nComputing self-PPL for corrected samples (ELBO method)...")
+corr_self_ppl = compute_self_ppl_with_elbo(pipe, corrected_texts, num_samples=32, batch_size=2)
+print(f"Corrected samples self-PPL: {corr_self_ppl['average_perplexity']:.2f}")
+
+# Calculate improvement in self-PPL (ELBO method)
+self_ppl_improvement = gen_self_ppl['average_perplexity'] - corr_self_ppl['average_perplexity']
+self_ppl_improvement_ratio = corr_self_ppl['average_perplexity'] / gen_self_ppl['average_perplexity']
+print(f"Self-PPL improvement: {self_ppl_improvement:.2f} (ratio: {self_ppl_improvement_ratio:.3f})")
 
 def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,7 +375,8 @@ print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 with open("Samples/generated_samples_metrics.json", "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": gen_metrics,
-        "self_perplexity_metrics": gen_self_ppl
+        "self_surprisal_metrics": gen_self_surprisal,
+        "self_ppl_metrics": gen_self_ppl
     }, f, indent=2)
 
 # Evaluate self-corrected samples
@@ -267,9 +393,14 @@ with open("Samples/corrected_samples_metrics.json", "w", encoding="utf-8") as f:
         "external_metrics": corr_metrics,
         "self_accuracies": self_accuracies,
         "average_self_accuracy": avg_self_accuracy,
-        "self_perplexity_metrics": corr_self_ppl,
-        "self_perplexity_improvement": {
-            "absolute_improvement": ppl_improvement,
-            "improvement_ratio": ppl_improvement_ratio
+        "self_surprisal_metrics": corr_self_surprisal,
+        "self_surprisal_improvement": {
+            "absolute_improvement": self_surprisal_improvement,
+            "improvement_ratio": self_surprisal_improvement_ratio
+        },
+        "self_ppl_metrics": corr_self_ppl,
+        "self_ppl_improvement": {
+            "absolute_improvement": self_ppl_improvement,
+            "improvement_ratio": self_ppl_improvement_ratio
         }
     }, f, indent=2) 
