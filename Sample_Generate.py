@@ -247,9 +247,9 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=64, t_eps=1e-4, batc
 
 
 # Check if generated samples file exists
-if os.path.exists("Samples/generated_samples_small.txt"):
+if os.path.exists("Samples/generated_samples.txt"):
     print("Loading existing generated samples from file...")
-    texts = load_samples_from_file("Samples/generated_samples_small.txt")
+    texts = load_samples_from_file("Samples/generated_samples.txt")
     print(f"Loaded {len(texts)} samples")
 else:
     print("Generating new samples...")
@@ -262,7 +262,7 @@ else:
     texts = generate_samples_in_batches(pipe, total_samples=16, batch_size=16)
 
     # Save the samples
-    with open("Samples/generated_samples_small.txt", "w", encoding="utf-8") as f:
+    with open("Samples/generated_samples.txt", "w", encoding="utf-8") as f:
         for i, text in enumerate(texts):
             f.write(f"Sample {i+1}:\n{text}\n\n")
 
@@ -277,7 +277,7 @@ corrected_texts, self_accuracies = pipe.self_correction(
 )
 
 # Save the corrected samples
-with open("Samples/corrected_samples_small.txt", "w", encoding="utf-8") as f:
+with open("Samples/corrected_samples.txt", "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
         f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
 
