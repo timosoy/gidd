@@ -105,6 +105,18 @@ class GiddPipeline(nn.Module):
                 for i in range(num_inference_steps):
                     with torch.no_grad(), torch.autocast(device.type, dtype=dtype):
                         z_t_next, acc = _correction_step(self.model, self.tokenizer, z_t, t, temperature)
+
+                        # Oscillation avoidance: check if the changed token would oscillate back
+                        changed_positions = (z_t_next != z_t).nonzero(as_tuple=True)[1]  # Get positions of changed tokens
+                        if len(changed_positions) > 0:
+                            # Only check the first (highest score) changed token
+                            changed_pos = changed_positions[0]
+                            # Simulate next step for this specific token
+                            z_t_next_next, _ = _correction_step(self.model, self.tokenizer, z_t_next, t, temperature)
+                            # If this token would change back to original, don't accept the change
+                            if z_t_next_next[0, changed_pos] == z_t[0, changed_pos]:
+                                z_t_next[0, changed_pos] = z_t[0, changed_pos]  # Revert this token
+                                
                         if early_stopping:
                             if acc > max_acc:
                                 max_acc = acc
