@@ -1,6 +1,8 @@
 import torch
 import json
 import os
+import logging
+from datetime import datetime
 from gidd.pipeline import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
@@ -11,6 +13,39 @@ from omegaconf import OmegaConf
 
 # Create Samples directory if it doesn't exist
 os.makedirs("Samples", exist_ok=True)
+os.makedirs("Logs", exist_ok=True)
+
+# Set up logging configuration
+def setup_logging():
+    """Setup logging to save to both console and file with timestamp"""
+    # Create timestamp for this run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"Logs/sample_generation_{timestamp}.log"
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()  # This keeps console output
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"=== Starting new sample generation session ===")
+    logger.info(f"Log file: {log_filename}")
+    return logger
+
+# Initialize logging
+logger = setup_logging()
+
+# Override print function to also log to file
+original_print = print
+def print(*args, **kwargs):
+    message = ' '.join(str(arg) for arg in args)
+    logger.info(message)
+    original_print(*args, **kwargs)
 
 def load_samples_from_file(filename):
     """Load samples from a text file"""
@@ -119,25 +154,36 @@ def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inf
     all_texts = []
     num_batches = (total_samples + batch_size - 1) // batch_size
     
+    logger.info(f"Starting sample generation: {total_samples} samples in {num_batches} batches of {batch_size}")
+    logger.info(f"Model device: {next(pipe.model.parameters()).device}")
+    logger.info(f"Number of inference steps: {num_inference_steps}")
+    
     print(f"Generating {total_samples} samples in {num_batches} batches of {batch_size}")
     
     for i in range(num_batches):
         current_batch_size = min(batch_size, total_samples - i * batch_size)
+        logger.info(f"Processing batch {i+1}/{num_batches}: generating {current_batch_size} samples")
         print(f"Batch {i+1}/{num_batches}: generating {current_batch_size} samples...")
         
-        batch_texts = pipe.generate(
-            num_samples=current_batch_size, 
-            num_inference_steps=num_inference_steps
-        )
-        all_texts.extend(batch_texts)
+        try:
+            batch_texts = pipe.generate(
+                num_samples=current_batch_size, 
+                num_inference_steps=num_inference_steps
+            )
+            all_texts.extend(batch_texts)
+            logger.info(f"Batch {i+1} completed successfully, total samples so far: {len(all_texts)}")
+        except Exception as e:
+            logger.error(f"Error in batch {i+1}: {str(e)}")
+            raise
         
         # Clear GPU cache between batches
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
+    logger.info(f"Sample generation completed. Total samples generated: {len(all_texts)}")
     return all_texts
 
-def compute_self_ppl_with_elbo(pipeline, texts, num_samples=64, t_eps=1e-4, batch_size=4):
+def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batch_size=16):
     """
     Compute self-PPL using the theoretically correct ELBO method from likelihood.py
     
@@ -181,8 +227,8 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=64, t_eps=1e-4, batc
         class MockLossConfig:
             def __init__(self):
                 self.loss_weighting = "uniform"
-                self.min_loss_weight = 0.1
-                self.max_loss_weight = 1.0
+                self.min_loss_weight = 0.0
+                self.max_loss_weight = 2.0
         
         class MockConfig:
             def __init__(self, real_config):
@@ -247,42 +293,74 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=64, t_eps=1e-4, batc
 
 
 # Check if generated samples file exists
-if os.path.exists("Samples/generated_samples.txt"):
+samples_file = "Samples/generated_samples_small.txt"
+if os.path.exists(samples_file):
+    logger.info(f"Found existing generated samples file: {samples_file}")
     print("Loading existing generated samples from file...")
-    texts = load_samples_from_file("Samples/generated_samples.txt")
+    texts = load_samples_from_file(samples_file)
+    logger.info(f"Successfully loaded {len(texts)} samples from file")
     print(f"Loaded {len(texts)} samples")
 else:
+    logger.info(f"No existing samples file found at {samples_file}, generating new samples")
     print("Generating new samples...")
     # Load the model
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Selected device: {device}")
+    
+    # Load model and move to appropriate device
+    logger.info("Loading model...")
     pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
-    pipe.to(device)
+    if device != "cpu":
+        logger.info(f"Moving model to {device}")
+        pipe.to(device)
+    
+    model_device = next(pipe.model.parameters()).device
+    logger.info(f"Model loaded on device: {model_device}")
 
     # Generate samples in batches
-    texts = generate_samples_in_batches(pipe, total_samples=16, batch_size=16)
+    texts = generate_samples_in_batches(pipe, total_samples=64, batch_size=32)
 
     # Save the samples
-    with open("Samples/generated_samples.txt", "w", encoding="utf-8") as f:
+    logger.info(f"Saving generated samples to: {samples_file}")
+    with open(samples_file, "w", encoding="utf-8") as f:
         for i, text in enumerate(texts):
             f.write(f"Sample {i+1}:\n{text}\n\n")
+    logger.info(f"Generated samples saved successfully to {samples_file}")
 
 # Load model for self-correction and evaluation
 device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Loading model for self-correction and evaluation on device: {device}")
+
+# Load model and move to appropriate device
+logger.info("Loading model...")
 pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
-pipe.to(device)
+if device != "cpu":
+    logger.info(f"Moving model to {device}")
+    pipe.to(device)
+
+model_device = next(pipe.model.parameters()).device
+logger.info(f"Model loaded on device: {model_device}")
 
 # Perform self-correction
+logger.info(f"Starting self-correction on {len(texts)} samples")
+logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
 corrected_texts, self_accuracies = pipe.self_correction(
     texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
 )
+logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
 # Save the corrected samples
-with open("Samples/corrected_samples.txt", "w", encoding="utf-8") as f:
+corrected_samples_file = "Samples/corrected_samples_small.txt"
+logger.info(f"Saving corrected samples to: {corrected_samples_file}")
+with open(corrected_samples_file, "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
         f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
+logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-with open("Samples/comparison.json", "w", encoding="utf-8") as f:
+comparison_file = "Samples/comparison_small.json"
+logger.info(f"Saving comparison data to: {comparison_file}")
+with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
         "samples": [
             {
@@ -293,6 +371,7 @@ with open("Samples/comparison.json", "w", encoding="utf-8") as f:
         ]
     }
     json.dump(comparison, f, ensure_ascii=False, indent=2)
+logger.info(f"Comparison data saved successfully")
 
 # =====================
 # Quantitative Evaluation (PPL & Accuracy)
@@ -300,12 +379,12 @@ with open("Samples/comparison.json", "w", encoding="utf-8") as f:
 
 # Compute self-surprisal for original samples (simplified method)
 print("\nComputing self-surprisal for generated samples (simplified method)...")
-gen_self_surprisal = compute_self_surprisal(pipe, texts, t_value=0.01, batch_size=4)
+gen_self_surprisal = compute_self_surprisal(pipe, texts, t_value=0.01, batch_size=16)
 print(f"Generated samples self-surprisal: {gen_self_surprisal['average_surprisal']:.2f}")
 
 # Compute self-surprisal for corrected samples (simplified method)
 print("\nComputing self-surprisal for corrected samples (simplified method)...")
-corr_self_surprisal = compute_self_surprisal(pipe, corrected_texts, t_value=0.01, batch_size=4)
+corr_self_surprisal = compute_self_surprisal(pipe, corrected_texts, t_value=0.01, batch_size=16)
 print(f"Corrected samples self-surprisal: {corr_self_surprisal['average_surprisal']:.2f}")
 
 # Calculate improvement in self-surprisal (simplified method)
@@ -315,12 +394,12 @@ print(f"Self-surprisal improvement: {self_surprisal_improvement:.2f} (ratio: {se
 
 # Compute self-PPL using ELBO method for original samples
 print("\nComputing self-PPL for generated samples (ELBO method)...")
-gen_self_ppl = compute_self_ppl_with_elbo(pipe, texts, num_samples=32, batch_size=2)
+gen_self_ppl = compute_self_ppl_with_elbo(pipe, texts, num_samples=32, batch_size=16)
 print(f"Generated samples self-PPL: {gen_self_ppl['average_perplexity']:.2f}")
 
 # Compute self-PPL using ELBO method for corrected samples
 print("\nComputing self-PPL for corrected samples (ELBO method)...")
-corr_self_ppl = compute_self_ppl_with_elbo(pipe, corrected_texts, num_samples=32, batch_size=2)
+corr_self_ppl = compute_self_ppl_with_elbo(pipe, corrected_texts, num_samples=32, batch_size=16)
 print(f"Corrected samples self-PPL: {corr_self_ppl['average_perplexity']:.2f}")
 
 # Calculate improvement in self-PPL (ELBO method)
@@ -370,25 +449,36 @@ def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512)
 
 # Evaluate generated samples
 print("\nEvaluating generated samples...")
+logger.info("Starting external evaluation of generated samples")
 gen_metrics = evaluate_texts(texts)
+logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
-with open("Samples/generated_samples_metrics.json", "w", encoding="utf-8") as f:
+
+gen_metrics_file = "Samples/generated_samples_metrics_small.json"
+logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
+with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": gen_metrics,
         "self_surprisal_metrics": gen_self_surprisal,
         "self_ppl_metrics": gen_self_ppl
     }, f, indent=2)
+logger.info("Generated samples metrics saved successfully")
 
 # Evaluate self-corrected samples
 print("\nEvaluating self-corrected samples...")
+logger.info("Starting external evaluation of corrected samples")
 corr_metrics = evaluate_texts(corrected_texts)
+logger.info(f"Corrected samples evaluation completed: PPL={corr_metrics['ppl']:.2f}, Accuracy={corr_metrics['accuracy']:.4f}")
 print("Self-corrected samples metrics:", json.dumps(corr_metrics, indent=2))
 
 # Calculate average self_accuracy
 avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
+logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-with open("Samples/corrected_samples_metrics.json", "w", encoding="utf-8") as f:
+corr_metrics_file = "Samples/corrected_samples_metrics_small.json"
+logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
+with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": corr_metrics,
         "self_accuracies": self_accuracies,
@@ -403,4 +493,16 @@ with open("Samples/corrected_samples_metrics.json", "w", encoding="utf-8") as f:
             "absolute_improvement": self_ppl_improvement,
             "improvement_ratio": self_ppl_improvement_ratio
         }
-    }, f, indent=2) 
+    }, f, indent=2)
+logger.info("Corrected samples metrics saved successfully")
+
+# Log final summary
+logger.info("=== Session Summary ===")
+logger.info(f"Generated samples: {len(texts)}")
+logger.info(f"Corrected samples: {len(corrected_texts)}")
+logger.info(f"Generated PPL: {gen_metrics['ppl']:.2f}")
+logger.info(f"Corrected PPL: {corr_metrics['ppl']:.2f}")
+logger.info(f"PPL improvement: {gen_metrics['ppl'] - corr_metrics['ppl']:.2f}")
+logger.info(f"Self-surprisal improvement: {self_surprisal_improvement:.2f}")
+logger.info(f"Self-PPL improvement: {self_ppl_improvement:.2f}")
+logger.info("=== Session completed successfully ===") 
