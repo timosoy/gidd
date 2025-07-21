@@ -293,7 +293,7 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
 
 
 # Check if generated samples file exists
-samples_file = "Samples/generated_samples_small.txt"
+samples_file = "Samples/generated_samples.txt"
 if os.path.exists(samples_file):
     logger.info(f"Found existing generated samples file: {samples_file}")
     print("Loading existing generated samples from file...")
@@ -350,7 +350,7 @@ corrected_texts, self_accuracies = pipe.self_correction(
 logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
 # Save the corrected samples
-corrected_samples_file = "Samples/corrected_samples_small.txt"
+corrected_samples_file = "Samples/corrected_samples.txt"
 logger.info(f"Saving corrected samples to: {corrected_samples_file}")
 with open(corrected_samples_file, "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
@@ -358,7 +358,7 @@ with open(corrected_samples_file, "w", encoding="utf-8") as f:
 logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_small.json"
+comparison_file = "Samples/comparison.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -454,7 +454,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_small.json"
+gen_metrics_file = "Samples/generated_samples_metrics.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -476,7 +476,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_small.json"
+corr_metrics_file = "Samples/corrected_samples_metrics.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
