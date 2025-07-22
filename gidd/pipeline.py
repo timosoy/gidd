@@ -67,6 +67,7 @@ class GiddPipeline(nn.Module):
         num_inference_steps: int = 128,
         temperature: float = 0.1,
         t0: float = 0.01,
+        tokens_per_step: int = 3,
         early_stopping: bool = True,
         early_stopping_patience: int = 32,
         show_progress: bool = True,
@@ -79,14 +80,19 @@ class GiddPipeline(nn.Module):
             corrected_texts: list of corrected samples
             self_accuracies: list of self-accuracy for each sample
         """
-        def _correction_step(model, tokenizer, z_t, t, temp):
+        def _correction_step(model, tokenizer, z_t, t, temp, tokens_per_step=3):
             logits = model(z_t, t)
             logits[..., tokenizer.mask_token_id] = -1e6
             p_t = (logits / temp).softmax(-1)
             z_tm1 = sample_categorical(p_t)
             score = (z_tm1 != z_t) * p_t.gather(-1, z_tm1.unsqueeze(-1)).squeeze(-1)
-            ids = torch.topk(score, 1, dim=-1).indices
-            z_tm1 = z_t.scatter(-1, ids, z_tm1.gather(-1, ids))
+            # Multi-token parallel correction: select top-k tokens to modify
+            num_changes = min(tokens_per_step, (score > 0).sum().item())
+            if num_changes > 0:
+                ids = torch.topk(score, num_changes, dim=-1).indices
+                z_tm1 = z_t.scatter(-1, ids, z_tm1.gather(-1, ids))
+            else:
+                z_tm1 = z_t  # No changes if no valid modifications
             acc = (z_tm1 == logits.argmax(-1)).float().mean().item()
             return z_tm1, acc
 
@@ -104,7 +110,7 @@ class GiddPipeline(nn.Module):
                 logits[..., self.tokenizer.mask_token_id] = -1e6
                 for i in range(num_inference_steps):
                     with torch.no_grad(), torch.autocast(device.type, dtype=dtype):
-                        z_t_next, acc = _correction_step(self.model, self.tokenizer, z_t, t, temperature)
+                        z_t_next, acc = _correction_step(self.model, self.tokenizer, z_t, t, temperature, tokens_per_step)
                         if early_stopping:
                             if acc > max_acc:
                                 max_acc = acc
