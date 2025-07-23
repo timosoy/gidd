@@ -276,8 +276,7 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
             all_metrics.append(batch_metrics)
     
     # Aggregate metrics across all batches
-    # Note: This is a simplified aggregation - for full accuracy we'd need to 
-    # properly weight by number of tokens in each batch
+    # Simplified aggregation 
     avg_nll = np.mean([m["nll"].item() for m in all_metrics])
     avg_ppl = np.mean([m["ppl"].item() for m in all_metrics])
     avg_seq_nll = np.mean([m["seq_nll"].item() for m in all_metrics])
