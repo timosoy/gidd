@@ -276,7 +276,8 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
             all_metrics.append(batch_metrics)
     
     # Aggregate metrics across all batches
-    # Simplified aggregation 
+    # Note: This is a simplified aggregation - for full accuracy we'd need to 
+    # properly weight by number of tokens in each batch
     avg_nll = np.mean([m["nll"].item() for m in all_metrics])
     avg_ppl = np.mean([m["ppl"].item() for m in all_metrics])
     avg_seq_nll = np.mean([m["seq_nll"].item() for m in all_metrics])
@@ -340,16 +341,23 @@ if device != "cpu":
 model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
-# Perform self-correction
+# Perform self-correction with progressive temperature scheduling
 logger.info(f"Starting self-correction on {len(texts)} samples")
-logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
+logger.info("Self-correction parameters: progressive temperature 0.5→0.1, multi-token correction, early_stopping=True")
 corrected_texts, self_accuracies = pipe.self_correction(
-    texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
+    texts, 
+    num_inference_steps=128, 
+    temperature_schedule="progressive",  # Enable progressive temperature
+    temp_start=0.5,                      # Start with exploration (higher temp)
+    temp_end=0.1,                        # End with precision (lower temp) 
+    tokens_per_step=3,                   # Multi-token correction
+    early_stopping=True, 
+    return_metrics=True
 )
 logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
 # Save the corrected samples
-corrected_samples_file = "Samples/corrected_samples.txt"
+corrected_samples_file = "Samples/corrected_samples_temperature.txt"
 logger.info(f"Saving corrected samples to: {corrected_samples_file}")
 with open(corrected_samples_file, "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
@@ -357,7 +365,7 @@ with open(corrected_samples_file, "w", encoding="utf-8") as f:
 logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison.json"
+comparison_file = "Samples/comparison_temperature.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -453,7 +461,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics.json"
+gen_metrics_file = "Samples/generated_samples_metrics_temperature.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -475,7 +483,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_temperature.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
