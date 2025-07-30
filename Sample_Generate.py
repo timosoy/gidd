@@ -343,14 +343,14 @@ logger.info(f"Model loaded on device: {model_device}")
 
 # Perform self-correction with progressive temperature scheduling
 logger.info(f"Starting self-correction on {len(texts)} samples")
-logger.info("Self-correction parameters: progressive temperature 0.5→0.1, multi-token correction, early_stopping=True")
+logger.info("Self-correction parameters: progressive temperature 0.5→0.1, single-token correction , early_stopping=True")
 corrected_texts, self_accuracies = pipe.self_correction(
     texts, 
     num_inference_steps=128, 
     temperature_schedule="progressive",  # Enable progressive temperature
     temp_start=0.5,                      # Start with exploration (higher temp)
     temp_end=0.1,                        # End with precision (lower temp) 
-    tokens_per_step=3,                   # Multi-token correction
+    tokens_per_step=1,                   # Single-token correction
     early_stopping=True, 
     return_metrics=True
 )
