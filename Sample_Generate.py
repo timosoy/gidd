@@ -3,6 +3,7 @@ import json
 import os
 import logging
 from datetime import datetime
+from collections import Counter
 from gidd.pipeline import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
@@ -48,19 +49,89 @@ def print(*args, **kwargs):
     original_print(*args, **kwargs)
 
 def load_samples_from_file(filename):
-    """Load samples from a text file"""
+    """Load samples from a text file. Supports headers 'Sample N:' and 'Corrected Sample N:'"""
     samples = []
     current_sample = ""
     with open(filename, "r", encoding="utf-8") as f:
         for line in f:
-            if line.startswith("Sample ") and current_sample:
+            if (line.startswith("Sample ") or line.startswith("Corrected Sample ")) and current_sample:
                 samples.append(current_sample.strip())
                 current_sample = ""
-            elif not line.startswith("Sample ") and line.strip():
+            elif not (line.startswith("Sample ") or line.startswith("Corrected Sample ")) and line.strip():
                 current_sample += line
         if current_sample.strip():
             samples.append(current_sample.strip())
     return samples
+
+def compute_shannon_entropy(texts, name, tokenizer, max_length=512):
+    """
+    Compute Shannon entropy for text samples
+    
+    Args:
+        texts: List of text strings
+        name: Name for logging (e.g., "Generated", "Corrected")
+        tokenizer: Tokenizer to use
+        max_length: Maximum sequence length for tokenization
+    
+    Returns:
+        dict: Contains entropy per sequence, per token, and total tokens
+    """
+    print(f"\nComputing Shannon entropy for {name} samples...")
+    
+    # Tokenize all texts
+    tokenized = tokenizer(
+        texts, 
+        return_tensors="pt", 
+        padding="max_length", 
+        truncation=True, 
+        max_length=max_length
+    )
+    z_ts = tokenized["input_ids"]
+    
+    total_ent = 0
+    total_token_ent = 0
+    total_tokens = 0
+    
+    with torch.no_grad():
+        for i, z_t in enumerate(z_ts):
+            if (i + 1) % 100 == 0 or (i == 0 and len(z_ts) > 1):
+                print(f"Processing sample {i+1}/{len(z_ts)}...")
+            
+            counts = Counter(z_t.tolist())
+            num_tokens = len(z_t)
+            
+            # Remove padding tokens
+            if tokenizer.pad_token_id in counts:
+                num_tokens -= counts[tokenizer.pad_token_id]
+                del counts[tokenizer.pad_token_id]
+
+            if len(counts) == 0:
+                # entropy of current seq is 0
+                continue
+            
+            # Calculate Shannon entropy using natural log
+            prs = torch.tensor(list(counts.values()), dtype=torch.float32)
+            prs = prs / prs.sum()
+            ent = -torch.sum(prs * torch.log(prs))
+            
+            total_ent += ent.item()
+            total_token_ent += ent.item() * num_tokens
+            total_tokens += num_tokens
+    
+    ent_per_seq = total_ent / len(z_ts)
+    ent_per_token = total_token_ent / total_tokens
+    
+    print(f"{name} entropy per sequence: {ent_per_seq:.4f}")
+    print(f"{name} entropy per token: {ent_per_token:.4f}")
+    print(f"Total tokens: {total_tokens}")
+    print(f"Samples analyzed: {len(z_ts)}")
+    
+    return {
+        "ent_per_seq": ent_per_seq,
+        "ent_per_token": ent_per_token,
+        "total_tokens": total_tokens,
+        "samples_analyzed": len(z_ts)
+    }
 
 def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
     """
@@ -148,6 +219,31 @@ def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
         "median_surprisal": median_ppl,
         "num_samples": len(all_perplexities)
     }
+
+
+def compute_self_accuracy_for_texts(pipeline, texts, t0=0.01, batch_size=16):
+    """Compute per-sample self-accuracy for given texts without running correction."""
+    device = next(pipeline.model.parameters()).device
+    mask_id = pipeline.tokenizer.mask_token_id
+    accuracies = []
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            tokenized = pipeline.tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=pipeline.config.max_seq_len,
+            )
+            input_ids = tokenized["input_ids"].to(device)
+            t = torch.full((input_ids.shape[0],), device=device, fill_value=t0)
+            logits = pipeline.model(input_ids, t)
+            logits[..., mask_id] = -1e6
+            argmax_ids = logits.argmax(-1)
+            batch_acc = (argmax_ids == input_ids).float().mean(dim=1).tolist()
+            accuracies.extend(batch_acc)
+    return accuracies
 
 def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inference_steps=128):
     """Generate samples in batches to avoid memory overflow"""
@@ -275,12 +371,16 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
             
             all_metrics.append(batch_metrics)
     
-    # Aggregate metrics across all batches
-    # Note: This is a simplified aggregation - for full accuracy we'd need to 
-    # properly weight by number of tokens in each batch
-    avg_nll = np.mean([m["nll"].item() for m in all_metrics])
-    avg_ppl = np.mean([m["ppl"].item() for m in all_metrics])
-    avg_seq_nll = np.mean([m["seq_nll"].item() for m in all_metrics])
+    # Aggregate metrics across all batches with proper weighting
+    total_token_nll = float(sum(m["token_nll_sum"].item() for m in all_metrics))
+    total_tokens = int(sum(m["token_count"].item() for m in all_metrics))
+    total_sequences = int(sum(m["batch_size"].item() for m in all_metrics))
+
+    # Token-weighted averages
+    avg_nll = total_token_nll / max(total_tokens, 1)
+    avg_ppl = float(np.exp(avg_nll))
+    # Sequence-average NLL: total token NLL per sequence count
+    avg_seq_nll = total_token_nll / max(total_sequences, 1)
     
     return {
         "average_nll": avg_nll,
@@ -341,31 +441,40 @@ if device != "cpu":
 model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
-# Perform self-correction with progressive temperature scheduling
-logger.info(f"Starting self-correction on {len(texts)} samples")
-logger.info("Self-correction parameters: progressive temperature 0.5→0.1, multi-token correction, early_stopping=True")
-corrected_texts, self_accuracies = pipe.self_correction(
-    texts, 
-    num_inference_steps=128, 
-    temperature_schedule="progressive",  # Enable progressive temperature
-    temp_start=0.5,                      # Start with exploration (higher temp)
-    temp_end=0.1,                        # End with precision (lower temp) 
-    tokens_per_step=3,                   # Multi-token correction
-    early_stopping=True, 
-    return_metrics=True
-)
-logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
+# Self-correction or reuse existing corrected samples
+corrected_samples_file = "Samples/corrected_samples_temp_0.5.txt"
+if os.path.exists(corrected_samples_file):
+    logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
+    corrected_texts = load_samples_from_file(corrected_samples_file)
+    # Compute self-accuracies directly on corrected texts
+    self_accuracies = compute_self_accuracy_for_texts(pipe, corrected_texts, t0=0.01, batch_size=16)
+    logger.info(f"Loaded {len(corrected_texts)} corrected samples from file")
+else:
+    # Perform self-correction
+    logger.info(f"Starting self-correction on {len(texts)} samples")
+    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
+    corrected_texts, self_accuracies = pipe.self_correction(
+        texts, 
+        num_inference_steps=128, 
+        temperature_schedule="progressive",  # Enable progressive temperature
+        temp_start=0.5,                      # Start with exploration (higher temp)
+        temp_end=0.1,                        # End with precision (lower temp) 
+        tokens_per_step=1,                   # Single-token correction
+        early_stopping=True, 
+        return_metrics=True
 
-# Save the corrected samples
-corrected_samples_file = "Samples/corrected_samples_temperature.txt"
-logger.info(f"Saving corrected samples to: {corrected_samples_file}")
-with open(corrected_samples_file, "w", encoding="utf-8") as f:
-    for i, text in enumerate(corrected_texts):
-        f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
-logger.info(f"Corrected samples saved successfully")
+    )
+    logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
+
+    # Save the corrected samples
+    logger.info(f"Saving corrected samples to: {corrected_samples_file}")
+    with open(corrected_samples_file, "w", encoding="utf-8") as f:
+        for i, text in enumerate(corrected_texts):
+            f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
+    logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_temperature.json"
+comparison_file = "Samples/comparison_temp_0.5.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -461,7 +570,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_temperature.json"
+gen_metrics_file = "Samples/generated_samples_metrics_temp_0.5.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -483,7 +592,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_temperature.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_temp_0.5.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -503,6 +612,62 @@ with open(corr_metrics_file, "w", encoding="utf-8") as f:
     }, f, indent=2)
 logger.info("Corrected samples metrics saved successfully")
 
+# =====================
+# Shannon Entropy Analysis
+# =====================
+
+print("\n" + "="*60)
+print("Shannon Entropy Analysis")
+print("="*60)
+
+# We need a tokenizer for entropy analysis - use gpt2 as a standard
+entropy_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+if entropy_tokenizer.pad_token_id is None:
+    entropy_tokenizer.pad_token = entropy_tokenizer.eos_token
+
+# Compute Shannon entropy for generated samples
+logger.info("Starting Shannon entropy analysis for generated samples")
+gen_entropy = compute_shannon_entropy(texts, "Generated", entropy_tokenizer, max_length=512)
+
+# Compute Shannon entropy for corrected samples
+logger.info("Starting Shannon entropy analysis for corrected samples")
+corr_entropy = compute_shannon_entropy(corrected_texts, "Corrected", entropy_tokenizer, max_length=512)
+
+# Calculate entropy changes
+seq_change = corr_entropy['ent_per_seq'] - gen_entropy['ent_per_seq']
+token_change = corr_entropy['ent_per_token'] - gen_entropy['ent_per_token']
+
+print(f"\nEntropy per sequence change: {seq_change:+.4f}")
+print(f"Entropy per token change: {token_change:+.4f}")
+
+# Save entropy analysis results
+entropy_results = {
+    "generated": {
+        "file": "generated_samples",
+        "ent_per_seq": gen_entropy['ent_per_seq'],
+        "ent_per_token": gen_entropy['ent_per_token'],
+        "tokens": gen_entropy['total_tokens']
+    },
+    "corrected": {
+        "file": "corrected_samples", 
+        "ent_per_seq": corr_entropy['ent_per_seq'],
+        "ent_per_token": corr_entropy['ent_per_token'],
+        "tokens": corr_entropy['total_tokens']
+    },
+    "changes": {
+        "ent_per_seq_change": seq_change,
+        "ent_per_token_change": token_change
+    }
+}
+
+entropy_results_file = "Samples/entropy_analysis.json"
+logger.info(f"Saving entropy analysis results to: {entropy_results_file}")
+with open(entropy_results_file, "w", encoding="utf-8") as f:
+    json.dump(entropy_results, f, indent=4)
+logger.info("Entropy analysis results saved successfully")
+
+print(f"\nEntropy analysis results saved to: {entropy_results_file}")
+
 # Log final summary
 
 logger.info("=== Session Summary ===")
@@ -513,4 +678,6 @@ logger.info(f"Corrected PPL: {corr_metrics['ppl']:.2f}")
 logger.info(f"PPL improvement: {gen_metrics['ppl'] - corr_metrics['ppl']:.2f}")
 logger.info(f"Self-surprisal improvement: {self_surprisal_improvement:.2f}")
 logger.info(f"Self-PPL improvement: {self_ppl_improvement:.2f}")
+logger.info(f"Shannon entropy per sequence change: {seq_change:+.4f}")
+logger.info(f"Shannon entropy per token change: {token_change:+.4f}")
 logger.info("=== Session completed successfully ===") 
