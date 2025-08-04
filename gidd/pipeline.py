@@ -74,7 +74,8 @@ class GiddPipeline(nn.Module):
         return_metrics: bool = False,
     ) -> tuple[list[str], list[float]]:
         """
-        Self-correction with metrics:
+        Self-correction method with metrics:
+        
         Returns:
             corrected_texts: list of corrected samples
             self_accuracies: list of self-accuracy for each sample

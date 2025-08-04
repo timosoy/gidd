@@ -3,6 +3,7 @@ import json
 import os
 import logging
 from datetime import datetime
+from collections import Counter
 from gidd.pipeline import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
@@ -61,6 +62,76 @@ def load_samples_from_file(filename):
         if current_sample.strip():
             samples.append(current_sample.strip())
     return samples
+
+def compute_shannon_entropy(texts, name, tokenizer, max_length=512):
+    """
+    Compute Shannon entropy for text samples
+    
+    Args:
+        texts: List of text strings
+        name: Name for logging (e.g., "Generated", "Corrected")
+        tokenizer: Tokenizer to use
+        max_length: Maximum sequence length for tokenization
+    
+    Returns:
+        dict: Contains entropy per sequence, per token, and total tokens
+    """
+    print(f"\nComputing Shannon entropy for {name} samples...")
+    
+    # Tokenize all texts
+    tokenized = tokenizer(
+        texts, 
+        return_tensors="pt", 
+        padding="max_length", 
+        truncation=True, 
+        max_length=max_length
+    )
+    z_ts = tokenized["input_ids"]
+    
+    total_ent = 0
+    total_token_ent = 0
+    total_tokens = 0
+    
+    with torch.no_grad():
+        for i, z_t in enumerate(z_ts):
+            if (i + 1) % 100 == 0 or (i == 0 and len(z_ts) > 1):
+                print(f"Processing sample {i+1}/{len(z_ts)}...")
+            
+            counts = Counter(z_t.tolist())
+            num_tokens = len(z_t)
+            
+            # Remove padding tokens
+            if tokenizer.pad_token_id in counts:
+                num_tokens -= counts[tokenizer.pad_token_id]
+                del counts[tokenizer.pad_token_id]
+
+            if len(counts) == 0:
+                # entropy of current seq is 0
+                continue
+            
+            # Calculate Shannon entropy using natural log
+            prs = torch.tensor(list(counts.values()), dtype=torch.float32)
+            prs = prs / prs.sum()
+            ent = -torch.sum(prs * torch.log(prs))
+            
+            total_ent += ent.item()
+            total_token_ent += ent.item() * num_tokens
+            total_tokens += num_tokens
+    
+    ent_per_seq = total_ent / len(z_ts)
+    ent_per_token = total_token_ent / total_tokens
+    
+    print(f"{name} entropy per sequence: {ent_per_seq:.4f}")
+    print(f"{name} entropy per token: {ent_per_token:.4f}")
+    print(f"Total tokens: {total_tokens}")
+    print(f"Samples analyzed: {len(z_ts)}")
+    
+    return {
+        "ent_per_seq": ent_per_seq,
+        "ent_per_token": ent_per_token,
+        "total_tokens": total_tokens,
+        "samples_analyzed": len(z_ts)
+    }
 
 def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
     """
@@ -495,6 +566,62 @@ with open(corr_metrics_file, "w", encoding="utf-8") as f:
     }, f, indent=2)
 logger.info("Corrected samples metrics saved successfully")
 
+# =====================
+# Shannon Entropy Analysis
+# =====================
+
+print("\n" + "="*60)
+print("Shannon Entropy Analysis")
+print("="*60)
+
+# We need a tokenizer for entropy analysis - use gpt2 as a standard
+entropy_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+if entropy_tokenizer.pad_token_id is None:
+    entropy_tokenizer.pad_token = entropy_tokenizer.eos_token
+
+# Compute Shannon entropy for generated samples
+logger.info("Starting Shannon entropy analysis for generated samples")
+gen_entropy = compute_shannon_entropy(texts, "Generated", entropy_tokenizer, max_length=512)
+
+# Compute Shannon entropy for corrected samples
+logger.info("Starting Shannon entropy analysis for corrected samples")
+corr_entropy = compute_shannon_entropy(corrected_texts, "Corrected", entropy_tokenizer, max_length=512)
+
+# Calculate entropy changes
+seq_change = corr_entropy['ent_per_seq'] - gen_entropy['ent_per_seq']
+token_change = corr_entropy['ent_per_token'] - gen_entropy['ent_per_token']
+
+print(f"\nEntropy per sequence change: {seq_change:+.4f}")
+print(f"Entropy per token change: {token_change:+.4f}")
+
+# Save entropy analysis results
+entropy_results = {
+    "generated": {
+        "file": "generated_samples",
+        "ent_per_seq": gen_entropy['ent_per_seq'],
+        "ent_per_token": gen_entropy['ent_per_token'],
+        "tokens": gen_entropy['total_tokens']
+    },
+    "corrected": {
+        "file": "corrected_samples", 
+        "ent_per_seq": corr_entropy['ent_per_seq'],
+        "ent_per_token": corr_entropy['ent_per_token'],
+        "tokens": corr_entropy['total_tokens']
+    },
+    "changes": {
+        "ent_per_seq_change": seq_change,
+        "ent_per_token_change": token_change
+    }
+}
+
+entropy_results_file = "Samples/entropy_analysis.json"
+logger.info(f"Saving entropy analysis results to: {entropy_results_file}")
+with open(entropy_results_file, "w", encoding="utf-8") as f:
+    json.dump(entropy_results, f, indent=4)
+logger.info("Entropy analysis results saved successfully")
+
+print(f"\nEntropy analysis results saved to: {entropy_results_file}")
+
 # Log final summary
 
 logger.info("=== Session Summary ===")
@@ -505,4 +632,6 @@ logger.info(f"Corrected PPL: {corr_metrics['ppl']:.2f}")
 logger.info(f"PPL improvement: {gen_metrics['ppl'] - corr_metrics['ppl']:.2f}")
 logger.info(f"Self-surprisal improvement: {self_surprisal_improvement:.2f}")
 logger.info(f"Self-PPL improvement: {self_ppl_improvement:.2f}")
+logger.info(f"Shannon entropy per sequence change: {seq_change:+.4f}")
+logger.info(f"Shannon entropy per token change: {token_change:+.4f}")
 logger.info("=== Session completed successfully ===") 
