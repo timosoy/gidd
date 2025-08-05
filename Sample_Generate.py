@@ -3,6 +3,7 @@ import json
 import os
 import logging
 from datetime import datetime
+from collections import Counter
 from gidd.pipeline import GiddPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
@@ -61,6 +62,76 @@ def load_samples_from_file(filename):
         if current_sample.strip():
             samples.append(current_sample.strip())
     return samples
+
+def compute_shannon_entropy(texts, name, tokenizer, max_length=512):
+    """
+    Compute Shannon entropy for text samples
+    
+    Args:
+        texts: List of text strings
+        name: Name for logging (e.g., "Generated", "Corrected")
+        tokenizer: Tokenizer to use
+        max_length: Maximum sequence length for tokenization
+    
+    Returns:
+        dict: Contains entropy per sequence, per token, and total tokens
+    """
+    print(f"\nComputing Shannon entropy for {name} samples...")
+    
+    # Tokenize all texts
+    tokenized = tokenizer(
+        texts, 
+        return_tensors="pt", 
+        padding="max_length", 
+        truncation=True, 
+        max_length=max_length
+    )
+    z_ts = tokenized["input_ids"]
+    
+    total_ent = 0
+    total_token_ent = 0
+    total_tokens = 0
+    
+    with torch.no_grad():
+        for i, z_t in enumerate(z_ts):
+            if (i + 1) % 100 == 0 or (i == 0 and len(z_ts) > 1):
+                print(f"Processing sample {i+1}/{len(z_ts)}...")
+            
+            counts = Counter(z_t.tolist())
+            num_tokens = len(z_t)
+            
+            # Remove padding tokens
+            if tokenizer.pad_token_id in counts:
+                num_tokens -= counts[tokenizer.pad_token_id]
+                del counts[tokenizer.pad_token_id]
+
+            if len(counts) == 0:
+                # entropy of current seq is 0
+                continue
+            
+            # Calculate Shannon entropy using natural log
+            prs = torch.tensor(list(counts.values()), dtype=torch.float32)
+            prs = prs / prs.sum()
+            ent = -torch.sum(prs * torch.log(prs))
+            
+            total_ent += ent.item()
+            total_token_ent += ent.item() * num_tokens
+            total_tokens += num_tokens
+    
+    ent_per_seq = total_ent / len(z_ts)
+    ent_per_token = total_token_ent / total_tokens
+    
+    print(f"{name} entropy per sequence: {ent_per_seq:.4f}")
+    print(f"{name} entropy per token: {ent_per_token:.4f}")
+    print(f"Total tokens: {total_tokens}")
+    print(f"Samples analyzed: {len(z_ts)}")
+    
+    return {
+        "ent_per_seq": ent_per_seq,
+        "ent_per_token": ent_per_token,
+        "total_tokens": total_tokens,
+        "samples_analyzed": len(z_ts)
+    }
 
 def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
     """
@@ -243,12 +314,7 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
     # Create ELBO function
     elbo_fn = ELBO(config, pipeline.model, pipeline.noise_schedule, loss_fn)
     
-    # Accumulators for precise aggregation
-    total_nll_sum = 0.0
-    total_tokens = 0
-    total_seq_nll_sum = 0.0
-    total_sequences = 0
-    per_sample_metrics = []
+    all_metrics = []
     
     print(f"Computing ELBO-based self-PPL for {len(texts)} texts with {num_samples} time samples...")
     
@@ -267,74 +333,30 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
             # Move to device
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            # Compute ELBO for this batch with token-level NLLs
-            batch_metrics, token_nlls = compute_elbo(
+            # Compute ELBO for this batch
+            batch_metrics = compute_elbo(
                 elbo_fn, 
                 batch, 
                 num_samples=num_samples, 
                 t_eps=t_eps, 
-                return_token_nlls=True,  # Get token-level information
+                return_token_nlls=False, 
                 reduce_metrics=False, 
                 show_progress=False
             )
             
-            # Precise aggregation using actual token counts
-            batch_attention_mask = batch["attention_mask"]
-            batch_tokens = batch_attention_mask.sum().item()
-            batch_sequences = batch_attention_mask.size(0)
-            
-            # Weighted accumulation by actual token count
-            batch_total_nll = (token_nlls * batch_attention_mask).sum().item()
-            total_nll_sum += batch_total_nll
-            total_tokens += batch_tokens
-            
-            # Sequence-level accumulation
-            batch_seq_nll = batch_total_nll / batch_sequences
-            total_seq_nll_sum += batch_seq_nll * batch_sequences
-            total_sequences += batch_sequences
-            
-            # Per-sample metrics for detailed analysis
-            for j in range(batch_sequences):
-                sample_mask = batch_attention_mask[j]
-                sample_tokens = sample_mask.sum().item()
-                if sample_tokens > 0:
-                    sample_nll = (token_nlls[j] * sample_mask).sum().item() / sample_tokens
-                    sample_ppl = np.exp(sample_nll)
-                    per_sample_metrics.append({
-                        "nll": sample_nll,
-                        "ppl": sample_ppl,
-                        "tokens": sample_tokens
-                    })
+            all_metrics.append(batch_metrics)
     
-    # Precise aggregate calculations
-    # Token-weighted average NLL
-    precise_avg_nll = total_nll_sum / total_tokens if total_tokens > 0 else float('inf')
-    precise_avg_ppl = np.exp(precise_avg_nll)
-    
-    # Sequence-weighted average seq_nll
-    precise_avg_seq_nll = total_seq_nll_sum / total_sequences if total_sequences > 0 else float('inf')
-    
-    # Additional statistics
-    per_sample_nlls = [m["nll"] for m in per_sample_metrics]
-    per_sample_ppls = [m["ppl"] for m in per_sample_metrics]
+    # Aggregate metrics across all batches
+    # Simplified aggregation 
+    avg_nll = np.mean([m["nll"].item() for m in all_metrics])
+    avg_ppl = np.mean([m["ppl"].item() for m in all_metrics])
+    avg_seq_nll = np.mean([m["seq_nll"].item() for m in all_metrics])
     
     return {
-        # Precise metrics (token-weighted)
-        "avg_nll": precise_avg_nll,
-        "avg_ppl": precise_avg_ppl,
-        "avg_seq_nll": precise_avg_seq_nll,
-        
-        # Per-sample statistics
-        "per_sample_nlls": per_sample_nlls,
-        "per_sample_ppls": per_sample_ppls,
-        "median_nll": np.median(per_sample_nlls) if per_sample_nlls else float('inf'),
-        "median_ppl": np.median(per_sample_ppls) if per_sample_ppls else float('inf'),
-        "std_nll": np.std(per_sample_nlls) if per_sample_nlls else 0.0,
-        "std_ppl": np.std(per_sample_ppls) if per_sample_ppls else 0.0,
-        
-        # Counts and metadata
-        "total_tokens": total_tokens,
-        "total_sequences": total_sequences,
+        "average_nll": avg_nll,
+        "average_perplexity": avg_ppl,
+        "average_seq_nll": avg_seq_nll,
+        "num_samples": len(texts),
         "num_time_samples": num_samples,
         "method": "ELBO"
     }
@@ -393,12 +415,12 @@ logger.info(f"Model loaded on device: {model_device}")
 logger.info(f"Starting self-correction on {len(texts)} samples")
 logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
 corrected_texts, self_accuracies = pipe.self_correction(
-    texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
+    texts, num_inference_steps=128, early_stopping=True, temperature=0.1, tokens_per_step=5,return_metrics=True
 )
 logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
 # Save the corrected samples
-corrected_samples_file = "Samples/corrected_samples_multitoken.txt"
+corrected_samples_file = "Samples/corrected_samples_multitoken_5.txt"
 logger.info(f"Saving corrected samples to: {corrected_samples_file}")
 with open(corrected_samples_file, "w", encoding="utf-8") as f:
     for i, text in enumerate(corrected_texts):
@@ -406,7 +428,7 @@ with open(corrected_samples_file, "w", encoding="utf-8") as f:
 logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_multitoken.json"
+comparison_file = "Samples/comparison_multitoken_5.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -442,22 +464,46 @@ print(f"Self-surprisal improvement: {self_surprisal_improvement:.2f} (ratio: {se
 
 # Compute self-PPL using ELBO method for original samples
 print("\nComputing self-PPL for generated samples (ELBO method)...")
-gen_self_ppl = compute_self_ppl_with_elbo(pipe, texts, num_samples=32, batch_size=16)
-print(f"Generated samples self-PPL (precise): {gen_self_ppl['avg_ppl']:.2f}")
-print(f"Generated samples median PPL: {gen_self_ppl['median_ppl']:.2f}")
-print(f"Generated samples total tokens: {gen_self_ppl['total_tokens']}")
+gen_self_ppl = compute_self_ppl_with_elbo(pipe, texts, num_samples=16, batch_size=8)
+print(f"Generated samples self-PPL: {gen_self_ppl['average_perplexity']:.2f}")
 
 # Compute self-PPL using ELBO method for corrected samples
 print("\nComputing self-PPL for corrected samples (ELBO method)...")
-corr_self_ppl = compute_self_ppl_with_elbo(pipe, corrected_texts, num_samples=32, batch_size=16)
-print(f"Corrected samples self-PPL (precise): {corr_self_ppl['avg_ppl']:.2f}")
-print(f"Corrected samples median PPL: {corr_self_ppl['median_ppl']:.2f}")
-print(f"Corrected samples total tokens: {corr_self_ppl['total_tokens']}")
+corr_self_ppl = compute_self_ppl_with_elbo(pipe, corrected_texts, num_samples=16, batch_size=8)
+print(f"Corrected samples self-PPL: {corr_self_ppl['average_perplexity']:.2f}")
 
 # Calculate improvement in self-PPL (ELBO method)
-self_ppl_improvement = gen_self_ppl['avg_ppl'] - corr_self_ppl['avg_ppl']
-self_ppl_improvement_ratio = corr_self_ppl['avg_ppl'] / gen_self_ppl['avg_ppl']
-print(f"Self-PPL improvement (precise): {self_ppl_improvement:.2f} (ratio: {self_ppl_improvement_ratio:.3f})")
+self_ppl_improvement = gen_self_ppl['average_perplexity'] - corr_self_ppl['average_perplexity']
+self_ppl_improvement_ratio = corr_self_ppl['average_perplexity'] / gen_self_ppl['average_perplexity']
+print(f"Self-PPL improvement: {self_ppl_improvement:.2f} (ratio: {self_ppl_improvement_ratio:.3f})")
+
+# =====================
+# Shannon Entropy Analysis
+# =====================
+
+print("\n" + "="*60)
+print("Shannon Entropy Analysis")
+print("="*60)
+
+# We need a tokenizer for entropy analysis - use gpt2 as a standard
+entropy_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+if entropy_tokenizer.pad_token_id is None:
+    entropy_tokenizer.pad_token = entropy_tokenizer.eos_token
+
+# Compute Shannon entropy for generated samples
+logger.info("Starting Shannon entropy analysis for generated samples")
+gen_entropy = compute_shannon_entropy(texts, "Generated", entropy_tokenizer, max_length=512)
+
+# Compute Shannon entropy for corrected samples
+logger.info("Starting Shannon entropy analysis for corrected samples")
+corr_entropy = compute_shannon_entropy(corrected_texts, "Corrected", entropy_tokenizer, max_length=512)
+
+# Calculate entropy changes
+seq_change = corr_entropy['ent_per_seq'] - gen_entropy['ent_per_seq']
+token_change = corr_entropy['ent_per_token'] - gen_entropy['ent_per_token']
+
+print(f"\nEntropy per sequence change: {seq_change:+.4f}")
+print(f"Entropy per token change: {token_change:+.4f}")
 
 def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -506,13 +552,14 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_multitoken.json"
+gen_metrics_file = "Samples/generated_samples_metrics_multitoken_5.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": gen_metrics,
         "self_surprisal_metrics": gen_self_surprisal,
-        "self_ppl_metrics": gen_self_ppl
+        "self_ppl_metrics": gen_self_ppl,
+        "entropy_metrics": gen_entropy
     }, f, indent=2)
 logger.info("Generated samples metrics saved successfully")
 
@@ -528,7 +575,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_multitoken.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_multitoken_5.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -545,9 +592,15 @@ with open(corr_metrics_file, "w", encoding="utf-8") as f:
             "absolute_improvement": self_ppl_improvement,
             "improvement_ratio": self_ppl_improvement_ratio
         },
-        "self_ppl_metrics": corr_self_ppl
+        "entropy_metrics": corr_entropy,
+        "entropy_improvements": {
+            "seq_change": seq_change,
+            "token_change": token_change,
+            "generated_entropy": gen_entropy
+        }
     }, f, indent=2)
 logger.info("Corrected samples metrics saved successfully")
+logger.info("Entropy analysis completed and integrated into metrics files")
 
 # Log final summary
 
@@ -559,4 +612,6 @@ logger.info(f"Corrected PPL: {corr_metrics['ppl']:.2f}")
 logger.info(f"PPL improvement: {gen_metrics['ppl'] - corr_metrics['ppl']:.2f}")
 logger.info(f"Self-surprisal improvement: {self_surprisal_improvement:.2f}")
 logger.info(f"Self-PPL improvement: {self_ppl_improvement:.2f}")
+logger.info(f"Shannon entropy per sequence change: {seq_change:+.4f}")
+logger.info(f"Shannon entropy per token change: {token_change:+.4f}")
 logger.info("=== Session completed successfully ===") 
