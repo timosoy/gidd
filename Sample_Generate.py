@@ -49,15 +49,15 @@ def print(*args, **kwargs):
     original_print(*args, **kwargs)
 
 def load_samples_from_file(filename):
-    """Load samples from a text file"""
+    """Load samples from a text file. Supports headers 'Sample N:' and 'Corrected Sample N:'"""
     samples = []
     current_sample = ""
     with open(filename, "r", encoding="utf-8") as f:
         for line in f:
-            if line.startswith("Sample ") and current_sample:
+            if (line.startswith("Sample ") or line.startswith("Corrected Sample ")) and current_sample:
                 samples.append(current_sample.strip())
                 current_sample = ""
-            elif not line.startswith("Sample ") and line.strip():
+            elif not (line.startswith("Sample ") or line.startswith("Corrected Sample ")) and line.strip():
                 current_sample += line
         if current_sample.strip():
             samples.append(current_sample.strip())
@@ -220,6 +220,31 @@ def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
         "num_samples": len(all_perplexities)
     }
 
+
+def compute_self_accuracy_for_texts(pipeline, texts, t0=0.01, batch_size=16):
+    """Compute per-sample self-accuracy for given texts without running correction."""
+    device = next(pipeline.model.parameters()).device
+    mask_id = pipeline.tokenizer.mask_token_id
+    accuracies = []
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            tokenized = pipeline.tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=pipeline.config.max_seq_len,
+            )
+            input_ids = tokenized["input_ids"].to(device)
+            t = torch.full((input_ids.shape[0],), device=device, fill_value=t0)
+            logits = pipeline.model(input_ids, t)
+            logits[..., mask_id] = -1e6
+            argmax_ids = logits.argmax(-1)
+            batch_acc = (argmax_ids == input_ids).float().mean(dim=1).tolist()
+            accuracies.extend(batch_acc)
+    return accuracies
+
 def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inference_steps=128):
     """Generate samples in batches to avoid memory overflow"""
     all_texts = []
@@ -346,11 +371,16 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
             
             all_metrics.append(batch_metrics)
     
-    # Aggregate metrics across all batches
-    # Simplified aggregation 
-    avg_nll = np.mean([m["nll"].item() for m in all_metrics])
-    avg_ppl = np.mean([m["ppl"].item() for m in all_metrics])
-    avg_seq_nll = np.mean([m["seq_nll"].item() for m in all_metrics])
+    # Aggregate metrics across all batches with proper weighting
+    total_token_nll = float(sum(m["token_nll_sum"].item() for m in all_metrics))
+    total_tokens = int(sum(m["token_count"].item() for m in all_metrics))
+    total_sequences = int(sum(m["batch_size"].item() for m in all_metrics))
+
+    # Token-weighted averages
+    avg_nll = total_token_nll / max(total_tokens, 1)
+    avg_ppl = float(np.exp(avg_nll))
+    # Sequence-average NLL: total token NLL per sequence count
+    avg_seq_nll = total_token_nll / max(total_sequences, 1)
     
     return {
         "average_nll": avg_nll,
@@ -411,21 +441,29 @@ if device != "cpu":
 model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
-# Perform self-correction
-logger.info(f"Starting self-correction on {len(texts)} samples")
-logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
-corrected_texts, self_accuracies = pipe.self_correction(
-    texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
-)
-logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
-
-# Save the corrected samples
+# Self-correction or reuse existing corrected samples
 corrected_samples_file = "Samples/corrected_samples.txt"
-logger.info(f"Saving corrected samples to: {corrected_samples_file}")
-with open(corrected_samples_file, "w", encoding="utf-8") as f:
-    for i, text in enumerate(corrected_texts):
-        f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
-logger.info(f"Corrected samples saved successfully")
+if os.path.exists(corrected_samples_file):
+    logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
+    corrected_texts = load_samples_from_file(corrected_samples_file)
+    # Compute self-accuracies directly on corrected texts
+    self_accuracies = compute_self_accuracy_for_texts(pipe, corrected_texts, t0=0.01, batch_size=16)
+    logger.info(f"Loaded {len(corrected_texts)} corrected samples from file")
+else:
+    # Perform self-correction
+    logger.info(f"Starting self-correction on {len(texts)} samples")
+    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
+    corrected_texts, self_accuracies = pipe.self_correction(
+        texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
+    )
+    logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
+
+    # Save the corrected samples
+    logger.info(f"Saving corrected samples to: {corrected_samples_file}")
+    with open(corrected_samples_file, "w", encoding="utf-8") as f:
+        for i, text in enumerate(corrected_texts):
+            f.write(f"Corrected Sample {i+1}:\n{text}\n\n")
+    logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
 comparison_file = "Samples/comparison.json"

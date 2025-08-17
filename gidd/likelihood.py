@@ -55,6 +55,9 @@ def compute_elbo(elbo_fn: ELBO, batch, num_samples=128, t_eps=1e-4, return_token
         "nll": nll,
         "ppl": nll.exp(),
         "seq_nll": seq_nll,
+        "token_count": total_tokens,
+        "token_nll_sum": total_nll,
+        "batch_size": total_batch_size,
     }
 
     return (metrics, token_nlls) if return_token_nlls else metrics
