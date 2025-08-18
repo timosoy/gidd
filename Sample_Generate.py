@@ -613,7 +613,7 @@ print("Shannon Entropy Analysis")
 print("="*60)
 
 # We need a tokenizer for entropy analysis - use gpt2 as a standard
-entropy_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+entropy_tokenizer = AutoTokenizer.from_pretrained("gpt2-large")
 if entropy_tokenizer.pad_token_id is None:
     entropy_tokenizer.pad_token = entropy_tokenizer.eos_token
 
