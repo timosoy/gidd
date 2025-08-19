@@ -279,7 +279,7 @@ def generate_samples_in_batches(pipe, total_samples=1000, batch_size=16, num_inf
     logger.info(f"Sample generation completed. Total samples generated: {len(all_texts)}")
     return all_texts
 
-def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batch_size=16):
+def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batch_size=16, gpu_chunk_size=8):
     """
     Compute self-PPL using the theoretically correct ELBO method from likelihood.py
     
@@ -357,19 +357,27 @@ def compute_self_ppl_with_elbo(pipeline, texts, num_samples=32, t_eps=1e-4, batc
             )
             # Move to device
             batch = {k: v.to(device) for k, v in batch.items()}
-            
-            # Compute ELBO for this batch
-            batch_metrics = compute_elbo(
-                elbo_fn, 
-                batch, 
-                num_samples=num_samples, 
-                t_eps=t_eps, 
-                return_token_nlls=False, 
-                reduce_metrics=False, 
-                show_progress=False
-            )
-            
-            all_metrics.append(batch_metrics)
+
+            # Further split the batch into smaller GPU chunks to reduce peak memory.
+            # This does not change results, only memory footprint.
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            bs = input_ids.size(0)
+            for j in range(0, bs, gpu_chunk_size):
+                sub_batch = {
+                    "input_ids": input_ids[j:j+gpu_chunk_size],
+                    "attention_mask": attention_mask[j:j+gpu_chunk_size],
+                }
+                sub_metrics = compute_elbo(
+                    elbo_fn,
+                    sub_batch,
+                    num_samples=num_samples,
+                    t_eps=t_eps,
+                    return_token_nlls=False,
+                    reduce_metrics=False,
+                    show_progress=False,
+                )
+                all_metrics.append(sub_metrics)
     
     # Aggregate metrics across all batches with proper weighting
     total_token_nll = float(sum(m["token_nll_sum"].item() for m in all_metrics))
@@ -442,7 +450,7 @@ model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
 # Self-correction or reuse existing corrected samples
-corrected_samples_file = "Samples/corrected_samples.txt"
+corrected_samples_file = "Samples/corrected_samples_multitoken_15.txt"
 if os.path.exists(corrected_samples_file):
     logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
     corrected_texts = load_samples_from_file(corrected_samples_file)
@@ -466,7 +474,7 @@ else:
     logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison.json"
+comparison_file = "Samples/comparison_multitoken_15.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -562,7 +570,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics.json"
+gen_metrics_file = "Samples/generated_samples_metrics_multitoken_15.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -584,7 +592,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_multitoken_15.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({

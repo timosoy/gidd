@@ -32,22 +32,37 @@ def compute_elbo(elbo_fn: ELBO, batch, num_samples=128, t_eps=1e-4, return_token
     device = batch["input_ids"].device
     ts = torch.linspace(t_eps, 1 - t_eps, num_samples, device=device)
 
-    elbos = []
-    for i in tqdm.trange(num_samples, disable=not show_progress):
-        t = ts[i, None].expand(batch["input_ids"].shape[0])
-        elbo = elbo_fn(batch["input_ids"], batch["attention_mask"], t)
-        elbos.append(elbo.cpu())
-    elbos = torch.stack(elbos, dim=0).to(device)
+    # Stream the mean over time samples to avoid stacking on GPU
+    sum_elbo_cpu = None  # accumulated sum of per-token NLLs on CPU
+    with torch.no_grad():
+        for i in tqdm.trange(num_samples, disable=not show_progress):
+            t = ts[i, None].expand(batch["input_ids"].shape[0])
+            elbo = elbo_fn(batch["input_ids"], batch["attention_mask"], t)
+            elbo_cpu = elbo.detach().to(torch.float32).cpu()
+            if sum_elbo_cpu is None:
+                sum_elbo_cpu = elbo_cpu
+            else:
+                sum_elbo_cpu += elbo_cpu
 
-    token_nlls = elbos.mean(dim=0)
-    total_nll = (token_nlls * batch["attention_mask"]).sum()
-    total_tokens = batch["attention_mask"].sum()
-    total_batch_size = torch.tensor(batch["input_ids"].size(0), device=device)
+    # Mean over time samples per token (CPU tensor: [batch, seq_len])
+    token_nlls = sum_elbo_cpu / float(num_samples)
+
+    # Compute totals on CPU to minimize GPU memory
+    attention_mask_cpu = batch["attention_mask"].cpu()
+    total_nll = (token_nlls * attention_mask_cpu).sum()
+    total_tokens = attention_mask_cpu.sum()
+    total_batch_size = torch.tensor(batch["input_ids"].size(0), dtype=torch.long)
+
+    # Optional distributed reduction on device
     if reduce_metrics and dist.is_available() and dist.is_initialized():
+        total_nll = total_nll.to(device)
+        total_tokens = total_tokens.to(device)
+        total_batch_size = total_batch_size.to(device)
         dist.all_reduce(total_nll)
         dist.all_reduce(total_tokens)
         dist.all_reduce(total_batch_size)
 
+    # Compute averages
     nll = total_nll / total_tokens
     seq_nll = total_nll / total_batch_size
 
@@ -60,6 +75,7 @@ def compute_elbo(elbo_fn: ELBO, batch, num_samples=128, t_eps=1e-4, return_token
         "batch_size": total_batch_size,
     }
 
+    # Return token_nlls on CPU to avoid unnecessary GPU memory use
     return (metrics, token_nlls) if return_token_nlls else metrics
 
 
