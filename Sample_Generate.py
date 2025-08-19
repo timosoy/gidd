@@ -450,7 +450,7 @@ model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
 # Self-correction or reuse existing corrected samples
-corrected_samples_file = "Samples/corrected_samples_temp_0.7.txt"
+corrected_samples_file = "Samples/corrected_samples_multitoken_10.txt"
 if os.path.exists(corrected_samples_file):
     logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
     corrected_texts = load_samples_from_file(corrected_samples_file)
@@ -474,7 +474,7 @@ else:
     logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_temp_0.7.json"
+comparison_file = "Samples/comparison_multitoken_10.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -570,7 +570,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_temp_0.7.json"
+gen_metrics_file = "Samples/generated_samples_multitoken_10.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -592,7 +592,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_temp_0.7.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_multitoken_10.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -640,33 +640,36 @@ token_change = corr_entropy['ent_per_token'] - gen_entropy['ent_per_token']
 print(f"\nEntropy per sequence change: {seq_change:+.4f}")
 print(f"Entropy per token change: {token_change:+.4f}")
 
-# Save entropy analysis results
-entropy_results = {
-    "generated": {
-        "file": "generated_samples",
-        "ent_per_seq": gen_entropy['ent_per_seq'],
-        "ent_per_token": gen_entropy['ent_per_token'],
-        "tokens": gen_entropy['total_tokens']
-    },
-    "corrected": {
-        "file": "corrected_samples", 
-        "ent_per_seq": corr_entropy['ent_per_seq'],
-        "ent_per_token": corr_entropy['ent_per_token'],
-        "tokens": corr_entropy['total_tokens']
-    },
-    "changes": {
-        "ent_per_seq_change": seq_change,
-        "ent_per_token_change": token_change
-    }
-}
+# Integrate entropy metrics directly into existing metrics files
+try:
+    # Update generated samples metrics
+    if 'gen_metrics_file' in globals() and os.path.exists(gen_metrics_file):
+        with open(gen_metrics_file, "r", encoding="utf-8") as f:
+            gen_data = json.load(f)
+        gen_data["entropy_metrics"] = gen_entropy
+        with open(gen_metrics_file, "w", encoding="utf-8") as f:
+            json.dump(gen_data, f, indent=2)
+        logger.info(f"Added entropy metrics to: {gen_metrics_file}")
+    else:
+        logger.warning("Generated metrics file not found when adding entropy; skipping.")
 
-entropy_results_file = "Samples/entropy_analysis.json"
-logger.info(f"Saving entropy analysis results to: {entropy_results_file}")
-with open(entropy_results_file, "w", encoding="utf-8") as f:
-    json.dump(entropy_results, f, indent=4)
-logger.info("Entropy analysis results saved successfully")
-
-print(f"\nEntropy analysis results saved to: {entropy_results_file}")
+    # Update corrected samples metrics
+    if 'corr_metrics_file' in globals() and os.path.exists(corr_metrics_file):
+        with open(corr_metrics_file, "r", encoding="utf-8") as f:
+            corr_data = json.load(f)
+        corr_data["entropy_metrics"] = corr_entropy
+        corr_data["entropy_improvements"] = {
+            "seq_change": seq_change,
+            "token_change": token_change,
+            "generated_entropy": gen_entropy,
+        }
+        with open(corr_metrics_file, "w", encoding="utf-8") as f:
+            json.dump(corr_data, f, indent=2)
+        logger.info(f"Added entropy metrics to: {corr_metrics_file}")
+    else:
+        logger.warning("Corrected metrics file not found when adding entropy; skipping.")
+except Exception as e:
+    logger.error(f"Failed to integrate entropy metrics into metrics files: {str(e)}")
 
 # Log final summary
 
