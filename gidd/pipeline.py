@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import tqdm.auto as tqdm
 from transformers import AutoModelForMaskedLM, AutoTokenizer
+import math
 
 from gidd.diffusion_process import HybridDiffusion
 from gidd.sampling import GiddSampler
@@ -68,6 +69,7 @@ class GiddPipeline(nn.Module):
         temperature: float = 0.1,
         t0: float = 0.01,
         tokens_per_step: int = 3,
+        selection_strategy: str = "entropy",
         early_stopping: bool = True,
         early_stopping_patience: int = 32,
         show_progress: bool = True,
@@ -80,17 +82,36 @@ class GiddPipeline(nn.Module):
             corrected_texts: list of corrected samples
             self_accuracies: list of self-accuracy for each sample
         """
-        def _correction_step(model, tokenizer, z_t, t, temp, tokens_per_step=3):
+        def _correction_step(model, tokenizer, z_t, t, temp, tokens_per_step=3, strategy: str = "entropy"):
             logits = model(z_t, t)
             logits[..., tokenizer.mask_token_id] = -1e6
             p_t = (logits / temp).softmax(-1)
-            z_tm1 = sample_categorical(p_t)
-            score = (z_tm1 != z_t) * p_t.gather(-1, z_tm1.unsqueeze(-1)).squeeze(-1)
-            # Multi-token parallel correction: select top-k tokens to modify
-            num_changes = min(tokens_per_step, (score > 0).sum().item())
+            # Proposal tokens for all positions
+            z_proposal = sample_categorical(p_t)
+
+            # Compute uncertainty scores per position
+            entropy_scores = - (p_t * torch.log(p_t + 1e-9)).sum(dim=-1)
+            top2_vals = torch.topk(p_t, 2, dim=-1).values
+            margin_uncertainty = 1.0 - (top2_vals[..., 0] - top2_vals[..., 1])
+            current_token_probs = p_t.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
+            nll_scores = -torch.log(current_token_probs + 1e-9)
+
+            # Select scoring strategy
+            if strategy == "entropy":
+                score = entropy_scores
+            elif strategy == "margin":
+                score = margin_uncertainty
+            elif strategy == "nll":
+                score = nll_scores
+            else:
+                # Fallback to original confidence-based change score
+                score = (z_proposal != z_t) * p_t.gather(-1, z_proposal.unsqueeze(-1)).squeeze(-1)
+
+            # Select top-k most uncertain positions
+            num_changes = min(int(tokens_per_step), int((score > 0).sum().item()))
             if num_changes > 0:
                 ids = torch.topk(score, num_changes, dim=-1).indices
-                z_tm1 = z_t.scatter(-1, ids, z_tm1.gather(-1, ids))
+                z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
             else:
                 z_tm1 = z_t  # No changes if no valid modifications
             acc = (z_tm1 == logits.argmax(-1)).float().mean().item()
@@ -109,8 +130,18 @@ class GiddPipeline(nn.Module):
                 logits = self.model(z_t, t)
                 logits[..., self.tokenizer.mask_token_id] = -1e6
                 for i in range(num_inference_steps):
+                    # Linear decay of tokens_per_step from initial value down to 1
+                    current_k = max(1, math.ceil(tokens_per_step * (1 - i / max(num_inference_steps, 1))))
                     with torch.no_grad(), torch.autocast(device.type, dtype=dtype):
-                        z_t_next, acc = _correction_step(self.model, self.tokenizer, z_t, t, temperature, tokens_per_step)
+                        z_t_next, acc = _correction_step(
+                            self.model,
+                            self.tokenizer,
+                            z_t,
+                            t,
+                            temperature,
+                            tokens_per_step=current_k,
+                            strategy=selection_strategy,
+                        )
                         if early_stopping:
                             if acc > max_acc:
                                 max_acc = acc
