@@ -28,42 +28,82 @@ SYSTEM_HINT = (
     "You are a strict grader. Return ONLY valid JSON. Do not include markdown fences or extra text."
 )
 
-# Pairwise comparison prompt (updated per request)
-COMPARISON_PROMPT_TEMPLATE = """Compare two texts on five aspects. Judge each aspect **in isolation** (a decision for one aspect must not affect any other aspect). For **each aspect**, provide:
+# Pairwise comparison prompts (split into non-factual aspects and factuality-only)
+COMPARISON_PROMPT_NONFACT_TEMPLATE = """Compare two texts on the four aspects below. Judge each aspect in isolation (a decision for one aspect must not affect any other aspect).
 
-* a brief **reasoning**; and
-* a single **winner** (“A” or “B”). **No ties**.
+Aspects:
 
-Aspects to judge:
+Clarity and coherence — Keeping in mind that the text may be cut off in the beginning
+and at the end due to it being an excerpt, how clear and understandable is the text?
 
-* Clarity and coherence — Each text may be cut at the beginning or end because it is an excerpt. Do not deduct points for truncation alone.
-* Grammaticality — Are there grammatical errors?
-* Factuality — If applicable, is the verifiable information accurate and reliable?
-* Writing style and fluency — Do sentences flow well? Is the vocabulary appropriate?
-* Creativity — How original and inventive is the text?
+Grammaticality — Are there grammatical errors?
 
-**Factuality special rule**
+Writing style and fluency — How well is the text written in terms of style and fluency? Do the
+sentences flow well, is the vocabulary appropriate?
 
-* If a text has no verifiable factual content, mark its factuality as “not applicable” in your reasoning. You must still select a winner for factuality **unless both texts are not applicable**.
-* If **both** texts are not applicable for factuality, set the factuality **winner** to **"N/A"**.
-* When exactly one text is not applicable, prefer the other text **only if** its factual statements are not incorrect or unsupported; otherwise choose the text with fewer incorrect or unsupported claims.
+Creativity — How original and creative is the text?
 
-**Tie-break guidance (when both seem equally strong for a non-factuality aspect)**
-Use these checks in order until one text is better:
+For each aspect:
 
-1. Fewer and milder issues for that aspect.
-2. Fewer issues per 100 words (length-normalised).
-3. Clearer structure/flow or more precise choices for that aspect.
+Give a short justification. Pick a winner for that aspect. No ties allowed.  
 
-**Output format**
-Return **valid JSON only**, no extra text. Use exactly this schema:
+Output valid JSON only, with no extra text, using exactly this schema:
 
 {{
-"clarity":        {{ "reasoning": "...", "winner": "A" | "B" }},
-"grammaticality": {{ "reasoning": "...", "winner": "A" | "B" }},
-"factuality":     {{ "reasoning": "state N/A if no verifiable facts", "winner": "A" | "B" | "N/A" }},
-"style":          {{ "reasoning": "...", "winner": "A" | "B" }},
-"creativity":     {{ "reasoning": "...", "winner": "A" | "B" }}
+"clarity": {{
+"A": {{ "reasoning": "..." }},
+"B": {{ "reasoning": "..." }},
+"winner": "A" | "B"
+}},
+"grammaticality": {{
+"A": {{ "reasoning": "..." }},
+"B": {{ "reasoning": "..." }},
+"winner": "A" | "B"
+}},
+"style": {{
+"A": {{ "reasoning": "..." }},
+"B": {{ "reasoning": "..." }},
+"winner": "A" | "B"
+}},
+"creativity": {{
+"A": {{ "reasoning": "..." }},
+"B": {{ "reasoning": "..." }},
+"winner": "A" | "B"
+}}
+}}
+
+Texts to judge:
+
+Text A:
+'''
+{text_A}
+'''
+
+Text B:
+'''
+{text_B}
+'''
+"""
+
+COMPARISON_PROMPT_FACT_TEMPLATE = """Compare two texts on factuality only. Judge this aspect in isolation. Do not penalize truncation if a text is an excerpt.
+
+Factuality — If applicable, is the factually verifiable information stated in the text (e.g., facts about geography, history) accurate and reliable?
+
+Instructions:
+- For each text, provide a brief reasoning focused only on factual correctness and support. If the text contains no verifiable factual content, clearly state “N/A” in the reasoning.
+- Choose a single winner for factuality:
+  - If both texts are “N/A”, set the winner to "N/A".
+  - If one text is “N/A” and the other has factual content that is not clearly incorrect, choose the one with factual content.
+  - If both have factual content, prefer the text with fewer incorrect or unsupported claims; if this appears equal, prefer the one with more precise and verifiable details; if still indistinguishable, choose the one whose lowercased text is earlier in alphabetical order.
+- Do not output any scores.
+
+Return valid JSON only, with no extra text, using exactly this schema:
+{{
+  "factuality": {{
+    "A": {{ "reasoning": "state N/A if no verifiable facts" }},
+    "B": {{ "reasoning": "state N/A if no verifiable facts" }},
+    "winner": "A" | "B" | "N/A"
+  }}
 }}
 
 Texts to judge:
@@ -221,18 +261,46 @@ def main():
                     "text_B": {"source": "file_a", "index": ia},
                 }
 
-            prompt = COMPARISON_PROMPT_TEMPLATE.format(text_A=text_A, text_B=text_B)
+            prompt_nonfact = COMPARISON_PROMPT_NONFACT_TEMPLATE.format(text_A=text_A, text_B=text_B)
+            prompt_fact = COMPARISON_PROMPT_FACT_TEMPLATE.format(text_A=text_A, text_B=text_B)
+
+            # Query non-factual aspects
             try:
-                raw = call_ollama_chat(args.model, prompt, debug=args.debug)
-                js = extract_json(raw) if raw else {}
+                raw_nonfact = call_ollama_chat(args.model, prompt_nonfact, debug=args.debug)
+                js_nonfact = extract_json(raw_nonfact) if raw_nonfact else {}
             except requests.HTTPError as e:
                 if args.debug:
-                    print(f"[pairwise HTTPError] {e}")
-                js = {}
+                    print(f"[pairwise nonfact HTTPError] {e}")
+                js_nonfact = {}
             except requests.RequestException as e:
                 if args.debug:
-                    print(f"[pairwise RequestException] {e}")
-                js = {}
+                    print(f"[pairwise nonfact RequestException] {e}")
+                js_nonfact = {}
+
+            # Query factuality
+            try:
+                raw_fact = call_ollama_chat(args.model, prompt_fact, debug=args.debug)
+                js_fact = extract_json(raw_fact) if raw_fact else {}
+            except requests.HTTPError as e:
+                if args.debug:
+                    print(f"[pairwise fact HTTPError] {e}")
+                js_fact = {}
+            except requests.RequestException as e:
+                if args.debug:
+                    print(f"[pairwise fact RequestException] {e}")
+                js_fact = {}
+
+            # Merge results into one schema matching previous downstream expectations
+            combined = {}
+            if isinstance(js_nonfact, dict):
+                for asp in ("clarity", "grammaticality", "style", "creativity"):
+                    v = js_nonfact.get(asp)
+                    if isinstance(v, dict):
+                        combined[asp] = v
+            if isinstance(js_fact, dict):
+                v = js_fact.get("factuality")
+                if isinstance(v, dict):
+                    combined["factuality"] = v
 
             rec = {
                 "pair_index": i,
@@ -241,10 +309,10 @@ def main():
                 "index_a": ia,
                 "index_b": ib,
                 "position_mapping": mapping,  # which source went to Text A/B
-                "result": js,
+                "result": combined,
             }
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            all_json.append(js)
+            all_json.append(combined)
 
     # Build summary: per-aspect winner counts by true source (file_a/file_b)
     aspects = ["clarity", "grammaticality", "factuality", "style", "creativity"]
