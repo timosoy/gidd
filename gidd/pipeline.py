@@ -69,7 +69,9 @@ class GiddPipeline(nn.Module):
         temperature: float = 0.1,
         t0: float = 0.01,
         tokens_per_step: int = 3,
-        selection_strategy: str = "entropy",
+        selection_strategy: str = "nll",
+        selection_mode: str = "topk",  # "topk" or "threshold"
+        conf_threshold: float = 0.2,    # used when selection_mode == "threshold"
         early_stopping: bool = True,
         early_stopping_patience: int = 32,
         show_progress: bool = True,
@@ -82,38 +84,55 @@ class GiddPipeline(nn.Module):
             corrected_texts: list of corrected samples
             self_accuracies: list of self-accuracy for each sample
         """
-        def _correction_step(model, tokenizer, z_t, t, temp, tokens_per_step=3, strategy: str = "entropy"):
+        def _correction_step(
+            model,
+            tokenizer,
+            z_t,
+            t,
+            temp,
+            tokens_per_step=3,
+            strategy: str = "nll",
+            selection_mode: str = "topk",
+            conf_threshold: float = 0.2,
+        ):
             logits = model(z_t, t)
             logits[..., tokenizer.mask_token_id] = -1e6
             p_t = (logits / temp).softmax(-1)
             # Proposal tokens for all positions
             z_proposal = sample_categorical(p_t)
 
-            # Compute uncertainty scores per position
-            entropy_scores = - (p_t * torch.log(p_t + 1e-9)).sum(dim=-1)
-            top2_vals = torch.topk(p_t, 2, dim=-1).values
-            margin_uncertainty = 1.0 - (top2_vals[..., 0] - top2_vals[..., 1])
+            # Compute scores used by selection strategies
             current_token_probs = p_t.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
             nll_scores = -torch.log(current_token_probs + 1e-9)
 
             # Select scoring strategy
-            if strategy == "entropy":
-                score = entropy_scores
-            elif strategy == "margin":
-                score = margin_uncertainty
-            elif strategy == "nll":
+            if strategy == "nll":
                 score = nll_scores
             else:
                 # Fallback to original confidence-based change score
                 score = (z_proposal != z_t) * p_t.gather(-1, z_proposal.unsqueeze(-1)).squeeze(-1)
 
-            # Select top-k most uncertain positions
-            num_changes = min(int(tokens_per_step), int((score > 0).sum().item()))
-            if num_changes > 0:
-                ids = torch.topk(score, num_changes, dim=-1).indices
-                z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+            # Low-confidence selection modes
+            if selection_mode == "threshold":
+                # Use current-token probability as confidence; replace all below threshold
+                low_mask = (current_token_probs < conf_threshold)
+                if low_mask.any():
+                    # Build indices tensor with shape [batch, num_changes]
+                    idx = torch.nonzero(low_mask[0], as_tuple=False).squeeze(-1)
+                    ids = idx.unsqueeze(0)
+                    z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                else:
+                    # Fallback: change at least one lowest-confidence position
+                    ids = torch.topk(-current_token_probs, k=min(1, z_t.size(-1)), dim=-1).indices
+                    z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
             else:
-                z_tm1 = z_t  # No changes if no valid modifications
+                # Default: top-k selection by score
+                num_changes = min(int(tokens_per_step), int((score > 0).sum().item()))
+                if num_changes > 0:
+                    ids = torch.topk(score, num_changes, dim=-1).indices
+                    z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                else:
+                    z_tm1 = z_t  # No changes if no valid modifications
             acc = (z_tm1 == logits.argmax(-1)).float().mean().item()
             return z_tm1, acc
 
@@ -141,6 +160,8 @@ class GiddPipeline(nn.Module):
                             temperature,
                             tokens_per_step=current_k,
                             strategy=selection_strategy,
+                            selection_mode=selection_mode,
+                            conf_threshold=conf_threshold,
                         )
                         if early_stopping:
                             if acc > max_acc:

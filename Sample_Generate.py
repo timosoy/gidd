@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from gidd.loss import get_loss
 from gidd.likelihood import ELBO, compute_elbo
 from omegaconf import OmegaConf
+import evaluate
 
 # Create Samples directory if it doesn't exist
 os.makedirs("Samples", exist_ok=True)
@@ -131,6 +132,33 @@ def compute_shannon_entropy(texts, name, tokenizer, max_length=512):
         "ent_per_token": ent_per_token,
         "total_tokens": total_tokens,
         "samples_analyzed": len(z_ts)
+    }
+
+
+def compute_bleu_metrics(original_texts, corrected_texts):
+    """Compute BLEU metrics comparing corrected texts against original references."""
+    pair_count = min(len(original_texts), len(corrected_texts))
+    if pair_count == 0:
+        return {
+            "pair_count": 0,
+            "corrected_vs_original": None,
+            "identity_original_vs_original": None,
+        }
+
+    trimmed_original = original_texts[:pair_count]
+    trimmed_corrected = corrected_texts[:pair_count]
+    references = [[ref] for ref in trimmed_original]
+
+    corrected_metric = evaluate.load("bleu")
+    corrected_vs_original = corrected_metric.compute(predictions=trimmed_corrected, references=references)
+
+    identity_metric = evaluate.load("bleu")
+    identity_original = identity_metric.compute(predictions=trimmed_original, references=references)
+
+    return {
+        "pair_count": pair_count,
+        "corrected_vs_original": corrected_vs_original,
+        "identity_original_vs_original": identity_original,
     }
 
 def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
@@ -450,7 +478,7 @@ model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
 # Self-correction or reuse existing corrected samples
-corrected_samples_file = "Samples/corrected_samples_nll.txt"
+corrected_samples_file = "Samples/corrected_samples_nll_threshold_0.05.txt"
 if os.path.exists(corrected_samples_file):
     logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
     corrected_texts = load_samples_from_file(corrected_samples_file)
@@ -460,9 +488,17 @@ if os.path.exists(corrected_samples_file):
 else:
     # Perform self-correction
     logger.info(f"Starting self-correction on {len(texts)} samples")
-    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1, strategy=entropy with linear decay of tokens_per_step")
+    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
     corrected_texts, self_accuracies = pipe.self_correction(
-        texts, num_inference_steps=128, early_stopping=True, temperature=0.1, tokens_per_step=1, selection_strategy="nll", return_metrics=True
+        texts,
+        num_inference_steps=128,
+        early_stopping=True,
+        temperature=0.1,
+        tokens_per_step=10,
+        selection_strategy="nll",
+        selection_mode="threshold",    
+        conf_threshold=0.05, 
+        return_metrics=True,
     )
     logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
@@ -474,7 +510,7 @@ else:
     logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_nll.json"
+comparison_file = "Samples/comparison_nll_threshold_0.05.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -523,6 +559,16 @@ self_ppl_improvement = gen_self_ppl['average_perplexity'] - corr_self_ppl['avera
 self_ppl_improvement_ratio = corr_self_ppl['average_perplexity'] / gen_self_ppl['average_perplexity']
 print(f"Self-PPL improvement: {self_ppl_improvement:.2f} (ratio: {self_ppl_improvement_ratio:.3f})")
 
+
+print("\nComputing BLEU scores for corrected samples against original samples...")
+logger.info("Computing BLEU metrics for corrected samples")
+bleu_metrics = compute_bleu_metrics(texts, corrected_texts)
+bleu_main = bleu_metrics.get("corrected_vs_original") or {}
+if bleu_main:
+    print(f"Corrected vs original BLEU: {bleu_main.get('bleu', float('nan')):.6f}")
+else:
+    print("BLEU metrics unavailable (no overlapping samples).")
+
 def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
@@ -570,13 +616,14 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_nll.json"
+gen_metrics_file = "Samples/generated_samples_metrics_nll_threshold_0.05.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": gen_metrics,
         "self_surprisal_metrics": gen_self_surprisal,
-        "self_ppl_metrics": gen_self_ppl
+        "self_ppl_metrics": gen_self_ppl,
+        "bleu": bleu_metrics
     }, f, indent=2)
 logger.info("Generated samples metrics saved successfully")
 
@@ -592,13 +639,14 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_nll.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_nll_threshold_0.05.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": corr_metrics,
         "self_accuracies": self_accuracies,
         "average_self_accuracy": avg_self_accuracy,
+        "bleu": bleu_metrics,
         "self_surprisal_metrics": corr_self_surprisal,
         "self_surprisal_improvement": {
             "absolute_improvement": self_surprisal_improvement,
@@ -640,36 +688,64 @@ token_change = corr_entropy['ent_per_token'] - gen_entropy['ent_per_token']
 print(f"\nEntropy per sequence change: {seq_change:+.4f}")
 print(f"Entropy per token change: {token_change:+.4f}")
 
-# Integrate entropy metrics directly into existing metrics files
+# Integrate entropy and reorder keys for readability in metrics files
 try:
-    # Update generated samples metrics
+    # Rebuild generated metrics with desired ordering
     if 'gen_metrics_file' in globals() and os.path.exists(gen_metrics_file):
-        with open(gen_metrics_file, "r", encoding="utf-8") as f:
-            gen_data = json.load(f)
-        gen_data["entropy_metrics"] = gen_entropy
+        gen_file = {
+            "external_metrics": gen_metrics,
+            "self_surprisal_improvement": {
+                "absolute_improvement": self_surprisal_improvement,
+                "improvement_ratio": self_surprisal_improvement_ratio
+            },
+            "self_ppl_metrics": gen_self_ppl,
+            "self_ppl_improvement": {
+                "absolute_improvement": self_ppl_improvement,
+                "improvement_ratio": self_ppl_improvement_ratio
+            },
+            "bleu": bleu_metrics,
+            "entropy_metrics": gen_entropy,
+            # Place per-sample arrays last
+            "self_surprisal_metrics": gen_self_surprisal,
+        }
         with open(gen_metrics_file, "w", encoding="utf-8") as f:
-            json.dump(gen_data, f, indent=2)
-        logger.info(f"Added entropy metrics to: {gen_metrics_file}")
+            json.dump(gen_file, f, indent=2)
+        logger.info(f"Reordered and updated: {gen_metrics_file}")
     else:
-        logger.warning("Generated metrics file not found when adding entropy; skipping.")
+        logger.warning("Generated metrics file not found when reordering; skipping.")
 
-    # Update corrected samples metrics
+    # Rebuild corrected metrics with desired ordering
     if 'corr_metrics_file' in globals() and os.path.exists(corr_metrics_file):
-        with open(corr_metrics_file, "r", encoding="utf-8") as f:
-            corr_data = json.load(f)
-        corr_data["entropy_metrics"] = corr_entropy
-        corr_data["entropy_improvements"] = {
-            "seq_change": seq_change,
-            "token_change": token_change,
-            "generated_entropy": gen_entropy,
+        corr_file = {
+            "external_metrics": corr_metrics,
+            "self_surprisal_improvement": {
+                "absolute_improvement": self_surprisal_improvement,
+                "improvement_ratio": self_surprisal_improvement_ratio
+            },
+            "self_ppl_metrics": corr_self_ppl,
+            "self_ppl_improvement": {
+                "absolute_improvement": self_ppl_improvement,
+                "improvement_ratio": self_ppl_improvement_ratio
+            },
+            "average_self_accuracy": avg_self_accuracy,
+            "bleu": bleu_metrics,
+            "entropy_metrics": corr_entropy,
+            "entropy_improvements": {
+                "seq_change": seq_change,
+                "token_change": token_change,
+                "generated_entropy": gen_entropy,
+            },
+            # Place per-sample arrays last
+            "self_accuracies": self_accuracies,
+            "self_surprisal_metrics": corr_self_surprisal,
         }
         with open(corr_metrics_file, "w", encoding="utf-8") as f:
-            json.dump(corr_data, f, indent=2)
-        logger.info(f"Added entropy metrics to: {corr_metrics_file}")
+            json.dump(corr_file, f, indent=2)
+        logger.info(f"Reordered and updated: {corr_metrics_file}")
     else:
-        logger.warning("Corrected metrics file not found when adding entropy; skipping.")
+        logger.warning("Corrected metrics file not found when reordering; skipping.")
 except Exception as e:
-    logger.error(f"Failed to integrate entropy metrics into metrics files: {str(e)}")
+    logger.error(f"Failed to reorder metrics files: {str(e)}")
 
 # Log final summary
 
@@ -684,3 +760,4 @@ logger.info(f"Self-PPL improvement: {self_ppl_improvement:.2f}")
 logger.info(f"Shannon entropy per sequence change: {seq_change:+.4f}")
 logger.info(f"Shannon entropy per token change: {token_change:+.4f}")
 logger.info("=== Session completed successfully ===") 
+logger.info(f"BLEU corrected vs original: {bleu_main.get('bleu', float('nan')):.6f}")
