@@ -478,7 +478,7 @@ model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
 # Self-correction or reuse existing corrected samples
-corrected_samples_file = "Samples/corrected_samples_nll_threshold_0.05.txt"
+corrected_samples_file = "Samples/corrected_samples_nll_temp_0.7.txt"
 if os.path.exists(corrected_samples_file):
     logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
     corrected_texts = load_samples_from_file(corrected_samples_file)
@@ -494,9 +494,10 @@ else:
         num_inference_steps=128,
         early_stopping=True,
         temperature=0.1,
-        tokens_per_step=10,
+        sampling_temperature=0.7,  
+        tokens_per_step=1,
         selection_strategy="nll",
-        selection_mode="threshold",    
+        selection_mode="topk",    
         conf_threshold=0.05, 
         return_metrics=True,
     )
@@ -510,7 +511,7 @@ else:
     logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_nll_threshold_0.05.json"
+comparison_file = "Samples/comparison_nll_temp_0.7.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -616,7 +617,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_nll_threshold_0.05.json"
+gen_metrics_file = "Samples/generated_samples_metrics_nll_temp_0.7.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -639,7 +640,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_nll_threshold_0.05.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_nll_temp_0.7.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({

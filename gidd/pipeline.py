@@ -67,6 +67,7 @@ class GiddPipeline(nn.Module):
         texts: list[str],
         num_inference_steps: int = 128,
         temperature: float = 0.1,
+        sampling_temperature: float = None,  # Temperature for sampling replacement tokens
         t0: float = 0.01,
         tokens_per_step: int = 3,
         selection_strategy: str = "nll",
@@ -90,6 +91,7 @@ class GiddPipeline(nn.Module):
             z_t,
             t,
             temp,
+            sampling_temp,
             tokens_per_step=3,
             strategy: str = "nll",
             selection_mode: str = "topk",
@@ -98,8 +100,19 @@ class GiddPipeline(nn.Module):
             logits = model(z_t, t)
             logits[..., tokenizer.mask_token_id] = -1e6
             p_t = (logits / temp).softmax(-1)
-            # Proposal tokens for all positions
-            z_proposal = sample_categorical(p_t)
+            
+            # Sample replacement tokens with separate temperature for NLL-based approach
+            if sampling_temp is not None:
+                if sampling_temp == 0.0:
+                    # Deterministic sampling: use argmax (temperature=0)
+                    z_proposal = logits.argmax(-1)
+                else:
+                    # Stochastic sampling with specified temperature
+                    p_sampling = (logits / sampling_temp).softmax(-1)
+                    z_proposal = sample_categorical(p_sampling)
+            else:
+                # Default behavior: use same temperature for uncertainty scoring and sampling
+                z_proposal = sample_categorical(p_t)
 
             # Compute scores used by selection strategies
             current_token_probs = p_t.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
@@ -158,6 +171,7 @@ class GiddPipeline(nn.Module):
                             z_t,
                             t,
                             temperature,
+                            sampling_temperature,
                             tokens_per_step=current_k,
                             strategy=selection_strategy,
                             selection_mode=selection_mode,
