@@ -488,9 +488,9 @@ if os.path.exists(corrected_samples_file):
 else:
     # Perform self-correction
     logger.info(f"Starting self-correction on {len(texts)} samples")
-    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
+    logger.info("Self-correction parameters: num_inference_steps=256, early_stopping=True, temperature=0.1")
     corrected_texts, self_accuracies = pipe.self_correction(
-        texts, num_inference_steps=128, early_stopping=True, temperature=0.1, return_metrics=True
+        texts, num_inference_steps=256, early_stopping=True, temperature=0.1, return_metrics=True
     )
     logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
@@ -631,7 +631,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_bleu1.json"
+corr_metrics_file = "Samples/corrected_samples_metrics.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
