@@ -73,16 +73,17 @@ class GiddPipeline(nn.Module):
         sampling_temperature_max: float | None = None,  # used by schedules
         position_sampling_temperature: float = None,  # Temperature for stochastic position selection (NLL-based)
         t0: float = 0.01,
-        tokens_per_step: int = 1,
+        tokens_per_step: int | None = None,
         selection_strategy: str = "nll",
-        selection_mode: str = "topk",  # "topk", "threshold", "dyn_threshold", or "stochastic"
+        selection_mode: str = "topk",  # "topk", "threshold", "dyn_threshold", "stochastic"， "topk_masked". or "dyn_ratio"
         conf_threshold: float = 0.2,    # used when selection_mode == "threshold"
-        dynamic_threshold_ratio: float = 0.7,  # used when selection_mode == "dyn_threshold" (0..1 of max NLL)
+        dynamic_threshold_ratio: float = 0.7,  # used when selection_mode == "dyn_ratio"(0..1 of max NLL)
         early_stopping: bool = True,
         early_stopping_patience: int = 32,
         show_progress: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         return_metrics: bool = False,
+        return_change_counts: bool = False,
     ) -> tuple[list[str], list[float]]:
         """
         Self-correction with metrics:
@@ -98,7 +99,7 @@ class GiddPipeline(nn.Module):
             temp,
             sampling_temp,
             pos_temp,
-            tokens_per_step=1,
+            tokens_per_step=None,
             strategy: str = "nll",
             selection_mode: str = "topk",
             conf_threshold: float = 0.2,
@@ -155,11 +156,23 @@ class GiddPipeline(nn.Module):
                     valid_mask = valid_mask & (z_t != pad_id)
                 # Assume batch size == 1 here as upstream uses per-sample correction
                 if z_t.size(0) != 1:
-                    # Fallback: vectorized top-k on score if unexpected batch
-                    k = max(1, int(tokens_per_step))
-                    k = min(k, z_t.size(-1))
-                    ids = torch.topk(nll_scores.masked_fill(~valid_mask, float('-inf')), k, dim=-1).indices
-                    z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                    masked_scores = nll_scores.masked_fill(~valid_mask, float('-inf'))
+                    if tokens_per_step is None or (isinstance(tokens_per_step, int) and tokens_per_step <= 0):
+                        # Ratio-based selection across batch: nll >= dyn_ratio * max(nll)
+                        max_vals, _ = torch.max(masked_scores, dim=-1, keepdim=True)
+                        thr_vals = dyn_ratio * max_vals
+                        sel = masked_scores >= thr_vals
+                        # Fallback ensure at least one per row
+                        any_sel = sel.any(dim=-1, keepdim=True)
+                        top1 = torch.topk(masked_scores, k=1, dim=-1).indices
+                        ids = torch.where(any_sel, torch.argmax(sel.to(torch.int), dim=-1, keepdim=True), top1)
+                        z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                    else:
+                        # Quantile/top-k path
+                        k = max(1, int(tokens_per_step))
+                        k = min(k, z_t.size(-1))
+                        ids = torch.topk(masked_scores, k, dim=-1).indices
+                        z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
                 else:
                     valid_idx = torch.nonzero(valid_mask[0], as_tuple=False).squeeze(-1)
                     L = int(valid_idx.numel())
@@ -168,25 +181,89 @@ class GiddPipeline(nn.Module):
                         ids = nll_scores.argmax(dim=-1, keepdim=True)
                         z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
                     else:
-                        k = max(1, int(tokens_per_step))
-                        if k > L:
-                            k = L
                         nll_valid = nll_scores[0, valid_idx]
-                        # Sort descending to obtain kth-largest as threshold
-                        sorted_vals, _ = torch.sort(nll_valid, descending=True)
-                        thr_val = sorted_vals[min(k - 1, L - 1)]
-                        # Select all positions >= threshold (robust to ties)
+                        if tokens_per_step is None or (isinstance(tokens_per_step, int) and tokens_per_step <= 0):
+                            # Ratio-based: select all with nll >= dyn_ratio * max(nll)
+                            max_val = torch.max(nll_valid)
+                            thr_val = dyn_ratio * max_val
+                            sel_in_valid = nll_valid >= thr_val
+                            cand_idx_in_valid = torch.nonzero(sel_in_valid, as_tuple=False).squeeze(-1)
+                            if cand_idx_in_valid.numel() == 0:
+                                cand_idx_in_valid = torch.topk(nll_valid, 1, dim=-1).indices
+                            final_ids = valid_idx[cand_idx_in_valid]
+                            ids = final_ids.unsqueeze(0)
+                            z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                        else:
+                            k = max(1, int(tokens_per_step))
+                            if k > L:
+                                k = L
+                            # Sort descending to obtain kth-largest as threshold
+                            sorted_vals, _ = torch.sort(nll_valid, descending=True)
+                            thr_val = sorted_vals[min(k - 1, L - 1)]
+                            # Select all positions >= threshold (robust to ties)
+                            sel_in_valid = nll_valid >= thr_val
+                            cand_idx_in_valid = torch.nonzero(sel_in_valid, as_tuple=False).squeeze(-1)
+                            if cand_idx_in_valid.numel() > k:
+                                # Cap to top-k among candidates by actual NLL
+                                cand_vals = nll_valid[cand_idx_in_valid]
+                                topk_in_cand = torch.topk(cand_vals, k, dim=-1).indices
+                                final_idx_in_valid = cand_idx_in_valid[topk_in_cand]
+                            else:
+                                final_idx_in_valid = cand_idx_in_valid
+                            final_ids = valid_idx[final_idx_in_valid]
+                            # Shape to [batch, num_changes]
+                            ids = final_ids.unsqueeze(0)
+                            z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+            elif selection_mode == "dyn_ratio":
+                # Threshold at a ratio of max NLL: select positions with nll >= dyn_ratio * max(nll)
+                pad_id = getattr(tokenizer, 'pad_token_id', None)
+                valid_mask = torch.ones_like(z_t, dtype=torch.bool)
+                if pad_id is not None:
+                    valid_mask = valid_mask & (z_t != pad_id)
+                if z_t.size(0) != 1:
+                    # Fallback: vectorized masked top-k if unexpected batch; approximate by top-k
+                    masked_scores = nll_scores.masked_fill(~valid_mask, float('-inf'))
+                    if tokens_per_step is None or (isinstance(tokens_per_step, int) and tokens_per_step <= 0):
+                        max_vals, _ = torch.max(masked_scores, dim=-1, keepdim=True)
+                        thr_vals = dyn_ratio * max_vals
+                        sel = masked_scores >= thr_vals
+                        any_sel = sel.any(dim=-1, keepdim=True)
+                        top1 = torch.topk(masked_scores, k=1, dim=-1).indices
+                        ids = torch.where(any_sel, torch.argmax(sel.to(torch.int), dim=-1, keepdim=True), top1)
+                        z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                    else:
+                        k = max(1, int(tokens_per_step))
+                        k = min(k, z_t.size(-1))
+                        ids = torch.topk(masked_scores, k, dim=-1).indices
+                        z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                else:
+                    valid_idx = torch.nonzero(valid_mask[0], as_tuple=False).squeeze(-1)
+                    L = int(valid_idx.numel())
+                    if L == 0:
+                        ids = nll_scores.argmax(dim=-1, keepdim=True)
+                        z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                    else:
+                        nll_valid = nll_scores[0, valid_idx]
+                        max_val = torch.max(nll_valid)
+                        thr_val = dyn_ratio * max_val
                         sel_in_valid = nll_valid >= thr_val
                         cand_idx_in_valid = torch.nonzero(sel_in_valid, as_tuple=False).squeeze(-1)
-                        if cand_idx_in_valid.numel() > k:
-                            # Cap to top-k among candidates by actual NLL
-                            cand_vals = nll_valid[cand_idx_in_valid]
-                            topk_in_cand = torch.topk(cand_vals, k, dim=-1).indices
-                            final_idx_in_valid = cand_idx_in_valid[topk_in_cand]
-                        else:
+                        if cand_idx_in_valid.numel() == 0:
+                            # Ensure at least one change: take the max NLL
+                            top1 = torch.topk(nll_valid, 1, dim=-1).indices
+                            cand_idx_in_valid = top1
+                        # Optional cap by tokens_per_step to avoid too many simultaneous edits
+                        if tokens_per_step is None or (isinstance(tokens_per_step, int) and tokens_per_step <= 0):
                             final_idx_in_valid = cand_idx_in_valid
+                        else:
+                            k = max(1, int(tokens_per_step))
+                            if cand_idx_in_valid.numel() > k:
+                                cand_vals = nll_valid[cand_idx_in_valid]
+                                topk_in_cand = torch.topk(cand_vals, k, dim=-1).indices
+                                final_idx_in_valid = cand_idx_in_valid[topk_in_cand]
+                            else:
+                                final_idx_in_valid = cand_idx_in_valid
                         final_ids = valid_idx[final_idx_in_valid]
-                        # Shape to [batch, num_changes]
                         ids = final_ids.unsqueeze(0)
                         z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
             elif selection_mode == "stochastic":
@@ -214,9 +291,24 @@ class GiddPipeline(nn.Module):
                             sampled_idx = sampled_idx.unsqueeze(-1)
                         ids = sampled_idx
                 z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+            elif selection_mode == "topk_masked":
+                # Same as default top-k, but exclude PAD positions from selection
+                pad_id = getattr(tokenizer, 'pad_token_id', None)
+                valid_mask = torch.ones_like(z_t, dtype=torch.bool)
+                if pad_id is not None:
+                    valid_mask = valid_mask & (z_t != pad_id)
+                masked_score = score.masked_fill(~valid_mask, float('-inf'))
+                k_val = 1 if (tokens_per_step is None or (isinstance(tokens_per_step, int) and tokens_per_step <= 0)) else int(tokens_per_step)
+                num_changes = min(k_val, int((masked_score > 0).sum().item()))
+                if num_changes > 0:
+                    ids = torch.topk(masked_score, num_changes, dim=-1).indices
+                    z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
+                else:
+                    z_tm1 = z_t
             else:
                 # Default: top-k selection by score
-                num_changes = min(int(tokens_per_step), int((score > 0).sum().item()))
+                k_val = 1 if (tokens_per_step is None or (isinstance(tokens_per_step, int) and tokens_per_step <= 0)) else int(tokens_per_step)
+                num_changes = min(k_val, int((score > 0).sum().item()))
                 if num_changes > 0:
                     ids = torch.topk(score, num_changes, dim=-1).indices
                     z_tm1 = z_t.scatter(-1, ids, z_proposal.gather(-1, ids))
@@ -229,17 +321,24 @@ class GiddPipeline(nn.Module):
         z_ts = self.tokenizer(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=self.config.max_seq_len)["input_ids"]
         corrected_zts = []
         self_accuracies = []
+        total_token_changes_list = []
+        final_token_diff_list = []
         with tqdm.tqdm(total=len(texts) * num_inference_steps, disable=not show_progress) as pbar:
             for z_t in z_ts:
                 max_acc = 0
                 curr_patience = 0
                 z_t = z_t.unsqueeze(0).to(device)
+                z_t_orig = z_t.clone()
+                per_sample_total_changes = 0
                 t = torch.full((z_t.shape[0],), device=device, fill_value=t0)
                 logits = self.model(z_t, t)
                 logits[..., self.tokenizer.mask_token_id] = -1e6
                 for i in range(num_inference_steps):
                     # Linear decay of tokens_per_step from initial value down to 1
-                    current_k = max(1, math.ceil(tokens_per_step * (1 - i / max(num_inference_steps, 1))))
+                    if tokens_per_step is None:
+                        current_k = None
+                    else:
+                        current_k = max(1, math.ceil(tokens_per_step * (1 - i / max(num_inference_steps, 1))))
                     # Compute per-step sampling temperature based on optional schedule
                     if sampling_temperature_schedule is None or sampling_temperature_schedule == "none":
                         current_sampling_temp = sampling_temperature
@@ -286,6 +385,7 @@ class GiddPipeline(nn.Module):
                             conf_threshold=conf_threshold,
                             dyn_ratio=dynamic_threshold_ratio,
                         )
+                        # Decide whether to commit this step and count changes accordingly
                         if early_stopping:
                             if acc > max_acc:
                                 max_acc = acc
@@ -296,6 +396,9 @@ class GiddPipeline(nn.Module):
                                     break
                             if (z_t == z_t_next).all():
                                 break
+                        # Commit update and count token changes for this step
+                        step_changes = int((z_t_next != z_t).sum().item())
+                        per_sample_total_changes += step_changes
                         z_t = z_t_next
                     pbar.update(1)
                 corrected_zts.append(z_t)
@@ -303,9 +406,16 @@ class GiddPipeline(nn.Module):
                 final_argmax = final_logits.argmax(-1)
                 self_acc = (z_t == final_argmax).float().mean().item()
                 self_accuracies.append(self_acc)
+                # Final diff vs original tokens
+                final_diff = int((z_t != z_t_orig).sum().item())
+                total_token_changes_list.append(per_sample_total_changes)
+                final_token_diff_list.append(final_diff)
             corrected_zts = torch.cat(corrected_zts, dim=0)
             corrected_samples = self.tokenizer.batch_decode(corrected_zts, skip_special_tokens=True)
             if return_metrics:
-                return corrected_samples, self_accuracies
+                if return_change_counts:
+                    return corrected_samples, self_accuracies, total_token_changes_list, final_token_diff_list
+                else:
+                    return corrected_samples, self_accuracies
             else:
                 return corrected_samples
