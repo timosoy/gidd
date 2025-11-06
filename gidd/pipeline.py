@@ -72,6 +72,7 @@ class GiddPipeline(nn.Module):
         show_progress: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         return_metrics: bool = False,
+        return_change_counts: bool = False,
     ) -> tuple[list[str], list[float]]:
         """
         Self-correction method with metrics:
@@ -95,11 +96,15 @@ class GiddPipeline(nn.Module):
         z_ts = self.tokenizer(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=self.config.max_seq_len)["input_ids"]
         corrected_zts = []
         self_accuracies = []
+        total_token_changes_list = []
+        final_token_diff_list = []
         with tqdm.tqdm(total=len(texts) * num_inference_steps, disable=not show_progress) as pbar:
             for z_t in z_ts:
                 max_acc = 0
                 curr_patience = 0
                 z_t = z_t.unsqueeze(0).to(device)
+                z_t_orig = z_t.clone()
+                per_sample_total_changes = 0
                 t = torch.full((z_t.shape[0],), device=device, fill_value=t0)
                 logits = self.model(z_t, t)
                 logits[..., self.tokenizer.mask_token_id] = -1e6
@@ -116,6 +121,9 @@ class GiddPipeline(nn.Module):
                                     break
                             if (z_t == z_t_next).all():
                                 break
+                        # Count changes before committing the new tokens
+                        step_changes = int((z_t_next != z_t).sum().item())
+                        per_sample_total_changes += step_changes
                         z_t = z_t_next
                     pbar.update(1)
                 corrected_zts.append(z_t)
@@ -123,9 +131,16 @@ class GiddPipeline(nn.Module):
                 final_argmax = final_logits.argmax(-1)
                 self_acc = (z_t == final_argmax).float().mean().item()
                 self_accuracies.append(self_acc)
+                # Final diff vs original tokens
+                final_diff = int((z_t != z_t_orig).sum().item())
+                total_token_changes_list.append(per_sample_total_changes)
+                final_token_diff_list.append(final_diff)
             corrected_zts = torch.cat(corrected_zts, dim=0)
             corrected_samples = self.tokenizer.batch_decode(corrected_zts, skip_special_tokens=True)
             if return_metrics:
-                return corrected_samples, self_accuracies
+                if return_change_counts:
+                    return corrected_samples, self_accuracies, total_token_changes_list, final_token_diff_list
+                else:
+                    return corrected_samples, self_accuracies
             else:
                 return corrected_samples
