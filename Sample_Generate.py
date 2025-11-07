@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from gidd.loss import get_loss
 from gidd.likelihood import ELBO, compute_elbo
 from omegaconf import OmegaConf
+import evaluate
 
 # Create Samples directory if it doesn't exist
 os.makedirs("Samples", exist_ok=True)
@@ -133,92 +134,34 @@ def compute_shannon_entropy(texts, name, tokenizer, max_length=512):
         "samples_analyzed": len(z_ts)
     }
 
-def compute_self_surprisal(pipeline, texts, t_value=0.01, batch_size=4):
-    """
-    Compute self-surprisal using the GIDD model itself.
-    
-    Args:
-        pipeline: GiddPipeline instance
-        texts: List of text strings to evaluate
-        t_value: Time value for diffusion model (lower = closer to clean data)
-        batch_size: Batch size for processing
-    
-    Returns:
-        dict: Contains per-sample and average self-surprisal metrics
-    """
-    device = next(pipeline.model.parameters()).device
-    all_perplexities = []
-    all_nlls = []
-    
-    print(f"Computing self-surprisal for {len(texts)} texts...")
-    
-    with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
-            
-            # Tokenize the batch
-            tokenized = pipeline.tokenizer(
-                batch_texts, 
-                return_tensors="pt", 
-                padding="max_length", 
-                truncation=True, 
-                max_length=pipeline.config.max_seq_len
-            )
-            input_ids = tokenized["input_ids"].to(device)
-            attention_mask = tokenized["attention_mask"].to(device)
-            
-            # Create time tensor - using small t_value for high quality evaluation
-            batch_size_actual = input_ids.shape[0]
-            t = torch.full((batch_size_actual,), fill_value=t_value, device=device)
-            
-            # Get model predictions
-            logits = pipeline.model(input_ids, t)
-            
-            # Mask out the [MASK] token to prevent the model from predicting it
-            logits[..., pipeline.tokenizer.mask_token_id] = -1e6
-            
-            # Compute cross-entropy loss for each position
-            # Shift inputs: predict next token based on previous tokens
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
-            shift_attention = attention_mask[..., :-1].contiguous()
-            
-            # Compute negative log-likelihood for each token
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), 
-                shift_labels.view(-1), 
-                reduction='none'
-            )
-            loss = loss.view(shift_labels.shape)  # [batch_size, seq_len-1]
-            
-            # Compute per-sample metrics
-            for j in range(batch_size_actual):
-                sample_loss = loss[j]
-                sample_attention = shift_attention[j]
-                
-                # Only consider non-padding tokens
-                valid_tokens = sample_attention.sum().item()
-                if valid_tokens > 0:
-                    # Average NLL for this sample
-                    sample_nll = (sample_loss * sample_attention).sum().item() / valid_tokens
-                    sample_ppl = np.exp(sample_nll)
-                    
-                    all_nlls.append(sample_nll)
-                    all_perplexities.append(sample_ppl)
-    
-    # Compute aggregate metrics
-    avg_nll = np.mean(all_nlls)
-    avg_ppl = np.mean(all_perplexities)
-    median_ppl = np.median(all_perplexities)
-    
+
+def compute_bleu_metrics(original_texts, corrected_texts):
+    """Compute BLEU metrics comparing corrected texts against original references."""
+    pair_count = min(len(original_texts), len(corrected_texts))
+    if pair_count == 0:
+        return {
+            "pair_count": 0,
+            "corrected_vs_original": None,
+            "identity_original_vs_original": None,
+        }
+
+    trimmed_original = original_texts[:pair_count]
+    trimmed_corrected = corrected_texts[:pair_count]
+    references = [[ref] for ref in trimmed_original]
+
+    corrected_metric = evaluate.load("bleu")
+    corrected_vs_original = corrected_metric.compute(predictions=trimmed_corrected, references=references)
+
+    identity_metric = evaluate.load("bleu")
+    identity_original = identity_metric.compute(predictions=trimmed_original, references=references)
+
     return {
-        "per_sample_surprisals": all_perplexities,
-        "per_sample_nlls": all_nlls,
-        "average_nll": avg_nll,
-        "average_surprisal": avg_ppl,
-        "median_surprisal": median_ppl,
-        "num_samples": len(all_perplexities)
+        "pair_count": pair_count,
+        "corrected_vs_original": corrected_vs_original,
+        "identity_original_vs_original": identity_original,
     }
+
+ 
 
 
 def compute_self_accuracy_for_texts(pipeline, texts, t0=0.01, batch_size=16):
@@ -450,7 +393,9 @@ model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
 # Self-correction or reuse existing corrected samples
-corrected_samples_file = "Samples/corrected_samples_multitoken_10.txt"
+corrected_samples_file = "Samples/corrected_samples_multitoken_8_1_steps.txt"
+total_token_changes_list = None
+final_token_diff_list = None
 if os.path.exists(corrected_samples_file):
     logger.info(f"Found existing corrected samples at {corrected_samples_file}. Skipping self-correction and proceeding to metrics analysis.")
     corrected_texts = load_samples_from_file(corrected_samples_file)
@@ -460,9 +405,15 @@ if os.path.exists(corrected_samples_file):
 else:
     # Perform self-correction
     logger.info(f"Starting self-correction on {len(texts)} samples")
-    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True, temperature=0.1")
-    corrected_texts, self_accuracies = pipe.self_correction(
-        texts, num_inference_steps=128, early_stopping=True, temperature=0.1, tokens_per_step=10, return_metrics=True
+    logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True")
+    corrected_texts, self_accuracies, total_token_changes_list, final_token_diff_list = pipe.self_correction(
+        texts,
+        num_inference_steps=1,
+        early_stopping=True,
+        temperature=0.1,
+        tokens_per_step=8,
+        return_metrics=True,
+        return_change_counts=True,
     )
     logger.info(f"Self-correction completed. Processed {len(corrected_texts)} samples")
 
@@ -474,7 +425,7 @@ else:
     logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_multitoken_10.json"
+comparison_file = "Samples/comparison_multitoken_8_1_steps.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -493,20 +444,7 @@ logger.info(f"Comparison data saved successfully")
 # Quantitative Evaluation (PPL & Accuracy)
 # =====================
 
-# Compute self-surprisal for original samples (simplified method)
-print("\nComputing self-surprisal for generated samples (simplified method)...")
-gen_self_surprisal = compute_self_surprisal(pipe, texts, t_value=0.01, batch_size=16)
-print(f"Generated samples self-surprisal: {gen_self_surprisal['average_surprisal']:.2f}")
-
-# Compute self-surprisal for corrected samples (simplified method)
-print("\nComputing self-surprisal for corrected samples (simplified method)...")
-corr_self_surprisal = compute_self_surprisal(pipe, corrected_texts, t_value=0.01, batch_size=16)
-print(f"Corrected samples self-surprisal: {corr_self_surprisal['average_surprisal']:.2f}")
-
-# Calculate improvement in self-surprisal (simplified method)
-self_surprisal_improvement = gen_self_surprisal['average_surprisal'] - corr_self_surprisal['average_surprisal']
-self_surprisal_improvement_ratio = corr_self_surprisal['average_surprisal'] / gen_self_surprisal['average_surprisal']
-print(f"Self-surprisal improvement: {self_surprisal_improvement:.2f} (ratio: {self_surprisal_improvement_ratio:.3f})")
+ 
 
 # Compute self-PPL using ELBO method for original samples
 print("\nComputing self-PPL for generated samples (ELBO method)...")
@@ -522,6 +460,16 @@ print(f"Corrected samples self-PPL: {corr_self_ppl['average_perplexity']:.2f}")
 self_ppl_improvement = gen_self_ppl['average_perplexity'] - corr_self_ppl['average_perplexity']
 self_ppl_improvement_ratio = corr_self_ppl['average_perplexity'] / gen_self_ppl['average_perplexity']
 print(f"Self-PPL improvement: {self_ppl_improvement:.2f} (ratio: {self_ppl_improvement_ratio:.3f})")
+
+
+print("\nComputing BLEU scores for corrected samples against original samples...")
+logger.info("Computing BLEU metrics for corrected samples")
+bleu_metrics = compute_bleu_metrics(texts, corrected_texts)
+bleu_main = bleu_metrics.get("corrected_vs_original") or {}
+if bleu_main:
+    print(f"Corrected vs original BLEU: {bleu_main.get('bleu', float('nan')):.6f}")
+else:
+    print("BLEU metrics unavailable (no overlapping samples).")
 
 def evaluate_texts(texts, model_name="gpt2-large", batch_size=4, max_length=512):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -570,13 +518,13 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_multitoken_10.json"
+gen_metrics_file = "Samples/generated_samples_metrics_multitoken_8_1_steps.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
         "external_metrics": gen_metrics,
-        "self_surprisal_metrics": gen_self_surprisal,
-        "self_ppl_metrics": gen_self_ppl
+        "self_ppl_metrics": gen_self_ppl,
+        "bleu": bleu_metrics
     }, f, indent=2)
 logger.info("Generated samples metrics saved successfully")
 
@@ -592,24 +540,50 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_multitoken_10.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_multitoken_8_1_steps.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
-    json.dump({
-        "external_metrics": corr_metrics,
-        "self_accuracies": self_accuracies,
-        "average_self_accuracy": avg_self_accuracy,
-        "self_surprisal_metrics": corr_self_surprisal,
-        "self_surprisal_improvement": {
-            "absolute_improvement": self_surprisal_improvement,
-            "improvement_ratio": self_surprisal_improvement_ratio
-        },
-        "self_ppl_metrics": corr_self_ppl,
-        "self_ppl_improvement": {
-            "absolute_improvement": self_ppl_improvement,
-            "improvement_ratio": self_ppl_improvement_ratio
-        }
-    }, f, indent=2)
+    token_change_summary = None
+    if (total_token_changes_list is not None) or (final_token_diff_list is not None):
+        token_change_summary = {}
+        if total_token_changes_list is not None and len(total_token_changes_list) > 0:
+            t = np.array(total_token_changes_list, dtype=float)
+            token_change_summary["total_token_changes_summary"] = {
+                "count": int(t.size),
+                "sum": float(t.sum()),
+                "mean": float(t.mean()),
+                "median": float(np.median(t)),
+                "min": float(t.min()),
+                "max": float(t.max()),
+            }
+        if final_token_diff_list is not None and len(final_token_diff_list) > 0:
+            d = np.array(final_token_diff_list, dtype=float)
+            token_change_summary["final_token_diffs_summary"] = {
+                "count": int(d.size),
+                "sum": float(d.sum()),
+                "mean": float(d.mean()),
+                "median": float(np.median(d)),
+                "min": float(d.min()),
+                "max": float(d.max()),
+            }
+    # Build dict in desired order: external -> self_accuracies -> average_self_accuracy -> token_change_summary -> others
+    base_corr = {}
+    base_corr["external_metrics"] = corr_metrics
+    base_corr["self_accuracies"] = self_accuracies
+    base_corr["average_self_accuracy"] = avg_self_accuracy
+    if token_change_summary is not None:
+        base_corr["token_change_summary"] = token_change_summary
+    base_corr["bleu"] = bleu_metrics
+    base_corr["self_ppl_metrics"] = corr_self_ppl
+    base_corr["self_ppl_improvement"] = {
+        "absolute_improvement": self_ppl_improvement,
+        "improvement_ratio": self_ppl_improvement_ratio
+    }
+    if total_token_changes_list is not None:
+        base_corr["total_token_changes"] = total_token_changes_list
+    if final_token_diff_list is not None:
+        base_corr["final_token_diffs"] = final_token_diff_list
+    json.dump(base_corr, f, indent=2)
 logger.info("Corrected samples metrics saved successfully")
 
 # =====================
@@ -640,36 +614,83 @@ token_change = corr_entropy['ent_per_token'] - gen_entropy['ent_per_token']
 print(f"\nEntropy per sequence change: {seq_change:+.4f}")
 print(f"Entropy per token change: {token_change:+.4f}")
 
-# Integrate entropy metrics directly into existing metrics files
+# Integrate entropy and reorder keys for readability in metrics files
 try:
-    # Update generated samples metrics
+    # Rebuild generated metrics with desired ordering
     if 'gen_metrics_file' in globals() and os.path.exists(gen_metrics_file):
-        with open(gen_metrics_file, "r", encoding="utf-8") as f:
-            gen_data = json.load(f)
-        gen_data["entropy_metrics"] = gen_entropy
+        gen_file = {
+            "external_metrics": gen_metrics,
+            "self_ppl_metrics": gen_self_ppl,
+            "self_ppl_improvement": {
+                "absolute_improvement": self_ppl_improvement,
+                "improvement_ratio": self_ppl_improvement_ratio
+            },
+            "bleu": bleu_metrics,
+            "entropy_metrics": gen_entropy,
+        }
         with open(gen_metrics_file, "w", encoding="utf-8") as f:
-            json.dump(gen_data, f, indent=2)
-        logger.info(f"Added entropy metrics to: {gen_metrics_file}")
+            json.dump(gen_file, f, indent=2)
+        logger.info(f"Reordered and updated: {gen_metrics_file}")
     else:
-        logger.warning("Generated metrics file not found when adding entropy; skipping.")
+        logger.warning("Generated metrics file not found when reordering; skipping.")
 
-    # Update corrected samples metrics
+    # Rebuild corrected metrics with desired ordering
     if 'corr_metrics_file' in globals() and os.path.exists(corr_metrics_file):
-        with open(corr_metrics_file, "r", encoding="utf-8") as f:
-            corr_data = json.load(f)
-        corr_data["entropy_metrics"] = corr_entropy
-        corr_data["entropy_improvements"] = {
+        # Build token change summary to place after self-accuracy
+        token_change_summary = None
+        if (total_token_changes_list is not None) or (final_token_diff_list is not None):
+            token_change_summary = {}
+            if total_token_changes_list is not None and len(total_token_changes_list) > 0:
+                t = np.array(total_token_changes_list, dtype=float)
+                token_change_summary["total_token_changes_summary"] = {
+                    "count": int(t.size),
+                    "sum": float(t.sum()),
+                    "mean": float(t.mean()),
+                    "median": float(np.median(t)),
+                    "min": float(t.min()),
+                    "max": float(t.max()),
+                }
+            if final_token_diff_list is not None and len(final_token_diff_list) > 0:
+                d = np.array(final_token_diff_list, dtype=float)
+                token_change_summary["final_token_diffs_summary"] = {
+                    "count": int(d.size),
+                    "sum": float(d.sum()),
+                    "mean": float(d.mean()),
+                    "median": float(np.median(d)),
+                    "min": float(d.min()),
+                    "max": float(d.max()),
+                }
+        # Build dict in the desired order
+        corr_file = {}
+        corr_file["external_metrics"] = corr_metrics
+        corr_file["self_ppl_metrics"] = corr_self_ppl
+        corr_file["self_ppl_improvement"] = {
+            "absolute_improvement": self_ppl_improvement,
+            "improvement_ratio": self_ppl_improvement_ratio
+        }
+        corr_file["average_self_accuracy"] = avg_self_accuracy
+        if token_change_summary is not None:
+            corr_file["token_change_summary"] = token_change_summary
+        corr_file["bleu"] = bleu_metrics
+        corr_file["entropy_metrics"] = corr_entropy
+        corr_file["entropy_improvements"] = {
             "seq_change": seq_change,
             "token_change": token_change,
             "generated_entropy": gen_entropy,
         }
+        # Place per-sample arrays last
+        corr_file["self_accuracies"] = self_accuracies
+        if total_token_changes_list is not None:
+            corr_file["total_token_changes"] = total_token_changes_list
+        if final_token_diff_list is not None:
+            corr_file["final_token_diffs"] = final_token_diff_list
         with open(corr_metrics_file, "w", encoding="utf-8") as f:
-            json.dump(corr_data, f, indent=2)
-        logger.info(f"Added entropy metrics to: {corr_metrics_file}")
+            json.dump(corr_file, f, indent=2)
+        logger.info(f"Reordered and updated: {corr_metrics_file}")
     else:
-        logger.warning("Corrected metrics file not found when adding entropy; skipping.")
+        logger.warning("Corrected metrics file not found when reordering; skipping.")
 except Exception as e:
-    logger.error(f"Failed to integrate entropy metrics into metrics files: {str(e)}")
+    logger.error(f"Failed to reorder metrics files: {str(e)}")
 
 # Log final summary
 
@@ -679,8 +700,8 @@ logger.info(f"Corrected samples: {len(corrected_texts)}")
 logger.info(f"Generated PPL: {gen_metrics['ppl']:.2f}")
 logger.info(f"Corrected PPL: {corr_metrics['ppl']:.2f}")
 logger.info(f"PPL improvement: {gen_metrics['ppl'] - corr_metrics['ppl']:.2f}")
-logger.info(f"Self-surprisal improvement: {self_surprisal_improvement:.2f}")
 logger.info(f"Self-PPL improvement: {self_ppl_improvement:.2f}")
 logger.info(f"Shannon entropy per sequence change: {seq_change:+.4f}")
 logger.info(f"Shannon entropy per token change: {token_change:+.4f}")
 logger.info("=== Session completed successfully ===") 
+logger.info(f"BLEU corrected vs original: {bleu_main.get('bleu', float('nan')):.6f}")
