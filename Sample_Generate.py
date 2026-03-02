@@ -393,7 +393,7 @@ model_device = next(pipe.model.parameters()).device
 logger.info(f"Model loaded on device: {model_device}")
 
 # Self-correction or reuse existing corrected samples
-corrected_samples_file = "Samples/corrected_samples_token_count.txt"
+corrected_samples_file = "Samples/corrected_samples_nll_temp_0.1_8_tokens_32_steps.txt"
 total_token_changes_list = None
 final_token_diff_list = None
 if os.path.exists(corrected_samples_file):
@@ -408,12 +408,12 @@ else:
     logger.info("Self-correction parameters: num_inference_steps=128, early_stopping=True")
     corrected_texts, self_accuracies, total_token_changes_list, final_token_diff_list = pipe.self_correction(
         texts,
-        num_inference_steps=128,
+        num_inference_steps=32,
         early_stopping=True,
         sampling_temperature=0.1,
         sampling_temperature_schedule="none",
-        tokens_per_step=1,
-        selection_strategy="original",
+        tokens_per_step=8,
+        selection_strategy="nll",
         selection_mode="topk",
         return_metrics=True,
         return_change_counts=True,
@@ -428,7 +428,7 @@ else:
     logger.info(f"Corrected samples saved successfully")
 
 # Compare the original and corrected samples
-comparison_file = "Samples/comparison_token_count.json"
+comparison_file = "Samples/comparison_nll_temp_0.1_8_tokens_32_steps.json"
 logger.info(f"Saving comparison data to: {comparison_file}")
 with open(comparison_file, "w", encoding="utf-8") as f:
     comparison = {
@@ -521,7 +521,7 @@ gen_metrics = evaluate_texts(texts)
 logger.info(f"Generated samples evaluation completed: PPL={gen_metrics['ppl']:.2f}, Accuracy={gen_metrics['accuracy']:.4f}")
 print("Generated samples metrics:", json.dumps(gen_metrics, indent=2))
 
-gen_metrics_file = "Samples/generated_samples_metrics_token_count.json"
+gen_metrics_file = "Samples/generated_samples_metrics_nll_temp_0.1_8_tokens_32_steps.json"
 logger.info(f"Saving generated samples metrics to: {gen_metrics_file}")
 with open(gen_metrics_file, "w", encoding="utf-8") as f:
     json.dump({
@@ -543,7 +543,7 @@ avg_self_accuracy = np.mean(self_accuracies) if self_accuracies else 0.0
 logger.info(f"Average self-accuracy calculated: {avg_self_accuracy:.4f}")
 print(f"Average self_accuracy: {avg_self_accuracy:.4f}")
 
-corr_metrics_file = "Samples/corrected_samples_metrics_token_count.json"
+corr_metrics_file = "Samples/corrected_samples_metrics_nll_temp_0.1_8_tokens_32_steps.json"
 logger.info(f"Saving corrected samples metrics to: {corr_metrics_file}")
 with open(corr_metrics_file, "w", encoding="utf-8") as f:
     token_change_summary = None
